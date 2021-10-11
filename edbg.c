@@ -75,10 +75,11 @@ static const struct option long_options[] =
   { "offset",    required_argument,  0, 'o' },
   { "size",      required_argument,  0, 'z' },
   { "fuse",      required_argument,  0, 'F' },
+  { "identify",  no_argument,  0, 'i' },
   { 0, 0, 0, 0 }
 };
 
-static const char *short_options = "hbepvkurf:t:ls:c:o:z:F:";
+static const char *short_options = "hbepvkurf:t:ls:c:o:z:F:i";
 
 /*- Variables ---------------------------------------------------------------*/
 static char *g_serial = NULL;
@@ -99,6 +100,7 @@ static target_options_t g_target_options =
   .offset       = -1,
   .size         = -1,
   .fuse_cmd     = NULL,
+  .identify      = false,
 };
 
 /*- Implementations ---------------------------------------------------------*/
@@ -385,6 +387,7 @@ static void print_help(char *name)
       "  -o, --offset <offset>      offset for the operation\n"
       "  -z, --size <size>          size for the operation\n"
       "  -F, --fuse <options>       operations on the fuses (use '-F help' for details)\n"
+      "  -i, --identify             print core id of target\n"
     );
   }
 
@@ -451,6 +454,7 @@ static void parse_command_line(int argc, char **argv)
       case 'o': g_target_options.offset = (uint32_t)strtoul(optarg, NULL, 0); break;
       case 'z': g_target_options.size = (uint32_t)strtoul(optarg, NULL, 0); break;
       case 'F': g_target_options.fuse_cmd = optarg; break;
+      case 'i': g_target_options.identify = true; break;
       default: exit(1); break;
     }
   }
@@ -540,6 +544,14 @@ int main(int argc, char **argv)
     verbose("Unlocking... ");
     target_ops->unlock();
     verbose(" done.\n");
+  }
+
+  if (g_target_options.identify)
+  {
+    //message("warning: this only works for samd21 and there is no check for that\n");
+    verbose("Indentifying... \n");
+    target_ops->identify();
+    verbose("done.\n");
   }
 
   if (g_target_options.erase)

@@ -45,6 +45,8 @@
 #define USER_ROW_SIZE          512
 #define USER_ROW_PAGE_SIZE     16
 
+#define SERIAL_ROW_ADDR        0x00806000
+
 #define DHCSR                  0xe000edf0
 #define DHCSR_DEBUGEN          (1 << 0)
 #define DHCSR_HALT             (1 << 1)
@@ -380,6 +382,18 @@ static char target_help[] =
   "  This device has one fuses section, which represents a complete User Row (256 bytes).\n";
 
 //-----------------------------------------------------------------------------
+
+static void target_identify(){
+  uint8_t buf[USER_ROW_SIZE];
+  dap_read_block(SERIAL_ROW_ADDR, buf, USER_ROW_SIZE);
+	uint32_t* addr = (uint32_t*)(buf + 0x1FC);
+	uint32_t* addr2 = (uint32_t*)(buf + 0x010);
+	uint32_t id = (*addr) ^ (*(addr2)) ^ (*(addr2+1)) ^ (*(addr2+2));
+  message("Core ID: %x\n",id);
+}
+
+//------------------------------------------------------------------------------
+
 target_ops_t target_atmel_cm4v2_ops = 
 {
   .select    = target_select,
@@ -390,6 +404,7 @@ target_ops_t target_atmel_cm4v2_ops =
   .program   = target_program,
   .verify    = target_verify,
   .read      = target_read,
+  .identify  = target_identify,
   .fread     = target_fuse_read,
   .fwrite    = target_fuse_write,
   .enumerate = target_enumerate,

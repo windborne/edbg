@@ -43,6 +43,7 @@ typedef struct
   bool         lock;
   bool         unlock;
   bool         read;
+  bool         identify;
   char         *name;
   int32_t      offset;
   int32_t      size;
@@ -63,6 +64,7 @@ typedef struct
   void (*program)(void);
   void (*verify)(void);
   void (*read)(void);
+  void (*identify)(void);
   int  (*fread)(int section, uint8_t *data);
   void (*fwrite)(int section, uint8_t *data);
   char *(*enumerate)(int i);
