@@ -734,7 +734,7 @@ void dap_transfer(void)
     data   = (uint32_t *)&dap_buf[2];
 
     if (dap_ops_size != count || DAP_TRANSFER_OK != status)
-      error_exit("invalid response during transfer (count = %d/%d, status = %d)", count, dap_ops_size, status);
+      error_exit("invalid response during transfer (count = %d/%d, status = %d): is the board turned on?", count, dap_ops_size, status);
 
     for (int i = 0; i < count; i++)
     {
