@@ -380,7 +380,11 @@ static void reconnect_debugger(void)
 {
   dap_disconnect();
   dap_connect(DAP_INTERFACE_SWD);
-  dap_transfer_configure(0, 32768, 128);
+  // 8 idle cycles between transfers: with pipelined packets the probe otherwise
+  // drives requests back-to-back with zero idle bits, and a target that misses
+  // a start bit ignores the (now misframed) request silently -- reads as ack=7
+  // line-dead bursts under sustained window>1 traffic.
+  dap_transfer_configure(8, 32768, 128);
   dap_swd_configure(0);
   dap_swj_clock(g_clock);
   dap_led(0, 1);

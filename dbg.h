@@ -55,5 +55,14 @@ void dbg_close(void);
 int dbg_get_report_size(void);
 int dbg_dap_cmd(uint8_t *data, int resp_size, int req_size);
 
+/* Pipelined variant: submit sends one request packet without waiting; reap blocks
+ * for the oldest outstanding response (responses arrive in request order — single
+ * HID endpoint pair; CMSIS-DAP probes process packets FIFO). Lets the host keep
+ * several packets in flight to hide per-round-trip USB latency. `cmd` is the
+ * expected command echo in the response. */
+void dbg_dap_cmd_submit(uint8_t *data, int req_size);
+int dbg_dap_cmd_reap(uint8_t cmd, uint8_t *data, int resp_size);
+int dbg_dap_cmd_reap_try(uint8_t cmd, uint8_t *data, int resp_size);
+
 #endif // _DBG_H_
 

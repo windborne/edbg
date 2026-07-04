@@ -144,3 +144,60 @@ int dbg_dap_cmd(uint8_t *data, int resp_size, int req_size)
   return res;
 }
 
+//-----------------------------------------------------------------------------
+void dbg_dap_cmd_submit(uint8_t *data, int req_size)
+{
+  int res;
+
+  memset(hid_buffer, 0xff, report_size + 1);
+
+  hid_buffer[0] = 0x00; // Report ID
+  memcpy(&hid_buffer[1], data, req_size);
+
+  res = hid_write(handle, hid_buffer, report_size + 1);
+  if (res < 0)
+  {
+    message("Error: %ls\n", hid_error(handle));
+    perror_exit("debugger write()");
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Like dbg_dap_cmd_reap but returns -1 on a mismatched/empty response instead
+// of exiting -- lets idempotent bulk transfers drain and retry transients.
+int dbg_dap_cmd_reap_try(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  int res;
+
+  res = hid_read(handle, hid_buffer, report_size + 1);
+  if (res <= 0)
+    return -1;
+
+  if (hid_buffer[0] != cmd)
+    return -1;
+
+  res--;
+  memcpy(data, &hid_buffer[1], (resp_size < res) ? resp_size : res);
+
+  return res;
+}
+
+//-----------------------------------------------------------------------------
+int dbg_dap_cmd_reap(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  int res;
+
+  res = hid_read(handle, hid_buffer, report_size + 1);
+  if (res < 0)
+    perror_exit("debugger read()");
+
+  check(res, "empty response received");
+
+  check(hid_buffer[0] == cmd, "invalid response received");
+
+  res--;
+  memcpy(data, &hid_buffer[1], (resp_size < res) ? resp_size : res);
+
+  return res;
+}
+

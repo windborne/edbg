@@ -94,6 +94,12 @@ void dap_write_word(uint32_t addr, uint32_t data);
 void dap_read_block(uint32_t addr, uint8_t *data, int size);
 void dap_write_block(uint32_t addr, uint8_t *data, int size);
 
+/* Bulk word transfers via DAP_TransferBlock (one header per ~128-word packet;
+ * the probe loops per word instead of dispatching per request — much faster).
+ * Pipelined; re-TARs at 1 KB auto-increment boundaries. Word-aligned only. */
+void dap_block_read(uint32_t addr, uint8_t *data, int size);
+void dap_block_write(uint32_t addr, uint8_t *data, int size);
+
 void dap_read_byte_req(uint32_t addr);
 void dap_read_half_req(uint32_t addr);
 void dap_read_word_req(uint32_t addr);
