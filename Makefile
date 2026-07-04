@@ -12,6 +12,9 @@ SRCS = \
   target_atmel_cm4v2.c \
   target_mchp_cm23.c \
   target_st_stm32g0.c \
+  target_st_stm32u5.c \
+  lz4.c \
+  lz4hc.c \
   target_gd_gd32f4xx.c \
   target_nu_m480.c \
   target_lattice_lcmxo2.c \
