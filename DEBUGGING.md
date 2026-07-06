@@ -38,6 +38,8 @@ fixed it — that localizes the bug.
 | `EDBG_U5_FULL_WRITE=1` | disable the differential scan (program every page) |
 | `EDBG_U5_SLOW_STUB=1` | skip the 16 MHz MSI raise (stubs run at reset 4 MHz) |
 | `EDBG_BULK_WINDOW=N` | USB packets in flight (default 1 — see wire physics) |
+| `EDBG_IDLE_CYCLES=N` | SWD idle cycles between transfers (default 8; raise on a noisy line) |
+| `EDBG_SWD_CFG=N` | raw DAP_SWD_Configure byte (bit 2 = always-data-phase; helps a noisy line resync after a corrupted ACK). Bits 0-1 (turnaround) need matching target DLCR — leave 0. |
 | `EDBG_PROFILE=1` | phase timing buckets printed after programming |
 | `EDBG_DEBUG_TRANSIENTS=1` | log each retried bulk transfer |
 | `EDBG_DEBUG_STUBS=1` | log each stub kick (page, buffer, address) |
@@ -154,6 +156,14 @@ the profiler and DWT buckets were wrong zero times.
   If you rebuild one: reset-catch first (a live app's IWDG resets mid-test —
   looks exactly like a storm), and compare only length-prefixed response
   bytes (padding beyond the declared length is uninitialized).
+- **Electrically noisy SWD line** (long/marginal cabling): sustained *writes*
+  storm (`status 7` the moment real write traffic starts) far below the read
+  clock ceiling — a corrupted ACK on a write desyncs the DP. Measured on one
+  noisy port: reads/identify OK to 8 MHz, plain writes reliable only to 3 MHz.
+  `EDBG_SWD_CFG=4` (always-data-phase) + `EDBG_IDLE_CYCLES=64` bought a clean
+  4 MHz (6/6 full-image soak) where plain 4 MHz stormed; 5 MHz+ storms
+  regardless. So: on a noisy line, drop the clock and add those two knobs
+  before assuming a hardware fault. The real fix is quieter cabling.
 
 ## DP wedge recovery
 

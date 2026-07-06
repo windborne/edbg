@@ -384,8 +384,26 @@ static void reconnect_debugger(void)
   // drives requests back-to-back with zero idle bits, and a target that misses
   // a start bit ignores the (now misframed) request silently -- reads as ack=7
   // line-dead bursts under sustained window>1 traffic.
-  dap_transfer_configure(8, 32768, 128);
-  dap_swd_configure(0);
+  //
+  // On an electrically noisy SWD line, sustained writes storm (ack=7) well
+  // below the read clock ceiling: the write->ACK bus turnaround is where a
+  // corrupted ACK bit desyncs the DP. Two knobs buy margin without dropping
+  // the clock -- SWD turnaround cycles (EDBG_SWD_TURNAROUND, 0..3 => 1..4
+  // cycles) and inter-transfer idle cycles (EDBG_IDLE_CYCLES). Defaults keep
+  // the fast-path behavior (turnaround 1 cycle, idle 8).
+  // NOTE: SWD turnaround (cfg bits 0..1) must MATCH the target DP's DLCR; a
+  // host-only bump misaligns every ACK. cfg bit 2 ("always data phase") does
+  // NOT need target coordination -- it keeps the probe clocking a full data
+  // phase after a non-OK ACK, so a corrupted ACK on a noisy line resyncs
+  // instead of cascading into a wedge. EDBG_SWD_CFG sets the raw cfg byte.
+  char *e_idle = getenv("EDBG_IDLE_CYCLES");
+  char *e_cfg  = getenv("EDBG_SWD_CFG");
+  int idle = e_idle ? atoi(e_idle) : 8;
+  int cfg  = e_cfg  ? atoi(e_cfg)  : 0;
+  if (idle < 0 || idle > 255) idle = 8;
+  if (cfg < 0 || cfg > 7) cfg = 0;
+  dap_transfer_configure((uint8_t)idle, 32768, 128);
+  dap_swd_configure(cfg);
   dap_swj_clock(g_clock);
   dap_led(0, 1);
 }
