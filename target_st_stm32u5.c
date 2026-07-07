@@ -311,12 +311,17 @@ static void target_deselect(void)
 {
   dap_write_word(DEMCR, 0);
 
-  // Clear ALL debug control state (C_DEBUGEN, C_HALT, C_MASKINTS) before the
-  // release reset: DHCSR persists across SYSRESETREQ while C_DEBUGEN is set,
-  // so a leftover C_MASKINTS (from the CRC stub harness) would leave the
-  // rebooted firmware running with every interrupt masked -- alive but with no
-  // SysTick/scheduler/console, which looks exactly like a dead board.
-  dap_write_word(DHCSR, DHCSR_DBGKEY);
+  // Clear the debug control state before the release reset. A leftover C_MASKINTS
+  // (set by the CRC stub harness) would otherwise leave the rebooted firmware
+  // running with every interrupt masked -- alive but with no SysTick/scheduler/
+  // console, which looks exactly like a dead board.
+  //
+  // ORDER MATTERS: on Cortex-M, C_MASKINTS is only writable while C_DEBUGEN=1 AND
+  // C_HALT=1 (ARMv8-M DHCSR rules), so clearing all three bits in one write can
+  // leave the mask set. Unmask FIRST (keep DEBUGEN+HALT, clear MASKINTS), THEN
+  // release DEBUGEN/HALT in a second write.
+  dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);  // C_MASKINTS := 0, still halted
+  dap_write_word(DHCSR, DHCSR_DBGKEY);                               // release C_DEBUGEN/C_HALT
 
   dap_write_word(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ);
 
