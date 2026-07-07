@@ -200,3 +200,50 @@ int dbg_dap_cmd(uint8_t *data, int resp_size, int req_size)
   return res;
 }
 
+//-----------------------------------------------------------------------------
+void dbg_dap_cmd_submit(uint8_t *data, int req_size)
+{
+  DWORD res;
+
+  memset(hid_buffer, 0xff, report_size + 1);
+
+  hid_buffer[0] = 0x00; // Report ID
+  memcpy(&hid_buffer[1], data, req_size);
+
+  if (FALSE == WriteFile(debugger_handle, (LPCVOID)hid_buffer, report_size + 1, &res, NULL))
+    error_exit("debugger write()");
+}
+
+//-----------------------------------------------------------------------------
+int dbg_dap_cmd_reap_try(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  DWORD res;
+
+  if (FALSE == ReadFile(debugger_handle, (LPVOID)hid_buffer, report_size + 1, &res, NULL))
+    return -1;
+
+  if (hid_buffer[1] != cmd)
+    return -1;
+
+  res -= 2;
+  memcpy(data, &hid_buffer[2], (resp_size < (int)res) ? resp_size : (int)res);
+
+  return res;
+}
+
+//-----------------------------------------------------------------------------
+int dbg_dap_cmd_reap(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  DWORD res;
+
+  if (FALSE == ReadFile(debugger_handle, (LPVOID)hid_buffer, report_size + 1, &res, NULL))
+    error_exit("debugger read()");
+
+  check(hid_buffer[1] == cmd, "invalid response received");
+
+  res -= 2;
+  memcpy(data, &hid_buffer[2], (resp_size < (int)res) ? resp_size : (int)res);
+
+  return res;
+}
+

@@ -222,6 +222,7 @@ typedef struct
 
 /*- Prototypes --------------------------------------------------------------*/
 static void dap_add_req(int type, int size, uint32_t addr, uint32_t data);
+static int bulk_window(void);
 
 /*- Variables ---------------------------------------------------------------*/
 static int dap_interface = DAP_INTERFACE_NONE;
@@ -382,6 +383,24 @@ void dap_reset_link(void)
 
   if (DAP_INTERFACE_SWD == dap_interface)
   {
+    // ADIv5.2 dormant-to-SWD Selection Alert first: a DP knocked into the
+    // dormant state (e.g. by garbage clocked during a failed too-fast session)
+    // ignores plain line resets forever -- this is why a wedged target used to
+    // need OpenOCD's init to recover. Non-dormant and pre-v5.2 DPs ignore the
+    // alert, so it is safe to always send. 224 bits: line reset, 128-bit alert
+    // sequence, 4 zero bits + 0x1A SWD activation code, line reset tail.
+    static const uint8_t dormant_alert[] = {
+      0xff, 0x92, 0xf3, 0x09, 0x62, 0x95, 0x2d, 0x85, 0x86, 0xe9,
+      0xaf, 0xdd, 0xe3, 0xa2, 0x0e, 0xbc, 0x19, 0xa0, 0xf1, 0xff,
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+    };
+
+    buf[0] = ID_DAP_SWJ_SEQUENCE;
+    buf[1] = sizeof(dormant_alert) * 8;   // 224
+    memcpy(&buf[2], dormant_alert, sizeof(dormant_alert));
+    dbg_dap_cmd(buf, sizeof(buf), 2 + sizeof(dormant_alert));
+    check(DAP_OK == buf[0], "SWJ_SEQUENCE (dormant alert) failed");
+
     buf[0] = ID_DAP_SWJ_SEQUENCE;
     buf[1] = (7 + 2 + 7 + 1) * 8;
     buf[2] = 0xff;
@@ -603,6 +622,12 @@ static bool buffer_request(dap_request_t *req)
   uint32_t address, csw;
   bool set_address;
 
+  // The DAP_Transfer count field is a single byte: never pack more than 250
+  // ops into one packet (a 1024-byte packet can otherwise fit up to 257 read
+  // ops, silently truncating the count to 1).
+  if (dap_ops_size >= 250)
+    return false;
+
   buf_size      = dap_buf_size;
   ops_size      = dap_ops_size;
   response_size = dap_response_size;
@@ -698,58 +723,94 @@ static bool buffer_request(dap_request_t *req)
 }
 
 //-----------------------------------------------------------------------------
+// Pipelined transfer: keep up to DAP_PIPELINE_DEPTH request packets in flight so
+// per-round-trip USB latency is hidden (responses arrive in request order; the
+// probe advertises a 16-deep packet queue with backpressure). A response error
+// exits the process; any still-queued responses are drained by the next
+// session's dbg_open().
+#define DAP_PIPELINE_DEPTH     8
+#define DAP_PIPELINE_MAX_OPS   1024   // ops per packet < report size (1 byte/op min)
+
 void dap_transfer(void)
 {
+  static uint8_t pkt_ops[DAP_PIPELINE_DEPTH][DAP_PIPELINE_MAX_OPS];
+  static int pkt_ops_size[DAP_PIPELINE_DEPTH];
+  static uint8_t resp_buf[TRANSFER_BUF_SIZE];
+  int build_count = 0;   // requests consumed into submitted packets
+  int inflight = 0, head = 0, tail = 0;
   int count, status;
   uint32_t *data;
 
   dap_response_count = 0;
   dap_csw = 0;
 
-  while (dap_response_count < dap_request_count)
+  while (build_count < dap_request_count || inflight > 0)
   {
-    dap_buf[0] = ID_DAP_TRANSFER;
-    dap_buf[1] = dap_jtag_index;
-    dap_buf[2] = 0; // Request size (placeholder)
-
-    dap_buf_size = 3;
-    dap_ops_size = 0;
-    dap_response_size = 2; // count and status
-
-    for (int i = dap_response_count; i < dap_request_count; i++)
+    // Fill the window
+    while (build_count < dap_request_count && inflight < bulk_window())
     {
-      if (!buffer_request(&dap_request[i]))
-        break;
+      int consumed = 0;
+
+      dap_buf[0] = ID_DAP_TRANSFER;
+      dap_buf[1] = dap_jtag_index;
+      dap_buf[2] = 0; // Request size (placeholder)
+
+      dap_buf_size = 3;
+      dap_ops_size = 0;
+      dap_response_size = 2; // count and status
+
+      for (int i = build_count; i < dap_request_count; i++)
+      {
+        if (!buffer_request(&dap_request[i]))
+          break;
+      }
+
+      dap_buf[2] = dap_ops_size;
+
+      // Requests consumed by this packet = data-bearing ops (OP_READ/OP_WRITE);
+      // OP_SIZE/OP_ADDRESS are CSW/TAR setup, OP_SKIP is the write half of a
+      // write-read pair whose request is consumed at its OP_READ.
+      for (int i = 0; i < dap_ops_size; i++)
+        if (OP_READ == dap_ops[i] || OP_WRITE == dap_ops[i])
+          consumed++;
+
+      memcpy(pkt_ops[tail], dap_ops, dap_ops_size);
+      pkt_ops_size[tail] = dap_ops_size;
+
+      dbg_dap_cmd_submit(dap_buf, dap_buf_size);
+
+      build_count += consumed;
+      tail = (tail + 1) % DAP_PIPELINE_DEPTH;
+      inflight++;
     }
 
-    dap_buf[2] = dap_ops_size;
+    // Reap the oldest outstanding response
+    dbg_dap_cmd_reap(ID_DAP_TRANSFER, resp_buf, sizeof(resp_buf));
 
-    //verbose("--- %d / %d, req_cnt = %d, resp_cnt = %d, resp_size = %d\n",
-    //  dap_ops_size, dap_buf_size, dap_request_count, dap_response_count, dap_response_size);
+    count  = resp_buf[0];
+    status = resp_buf[1];
+    data   = (uint32_t *)&resp_buf[2];
 
-    dbg_dap_cmd(dap_buf, sizeof(dap_buf), dap_buf_size);
-
-    count  = dap_buf[0];
-    status = dap_buf[1];
-    data   = (uint32_t *)&dap_buf[2];
-
-    if (dap_ops_size != count || DAP_TRANSFER_OK != status)
-      error_exit("invalid response during transfer (count = %d/%d, status = %d): is the board turned on?", count, dap_ops_size, status);
+    if (pkt_ops_size[head] != count || DAP_TRANSFER_OK != status)
+      error_exit("invalid response during transfer (count = %d/%d, status = %d): is the board turned on?", count, pkt_ops_size[head], status);
 
     for (int i = 0; i < count; i++)
     {
       dap_request_t *req = &dap_request[dap_response_count];
 
-      if (OP_READ == dap_ops[i])
+      if (OP_READ == pkt_ops[head][i])
       {
         dap_response[dap_response_count++] = from_lane(req->size, req->addr, *data);
         data++;
       }
-      else if (OP_WRITE == dap_ops[i])
+      else if (OP_WRITE == pkt_ops[head][i])
       {
         dap_response[dap_response_count++] = req->data;
       }
     }
+
+    head = (head + 1) % DAP_PIPELINE_DEPTH;
+    inflight--;
   }
 
   dap_request_count = 0;
@@ -760,6 +821,233 @@ uint32_t dap_get_response(int index)
 {
   assert(index < dap_response_count);
   return dap_response[index];
+}
+
+//-----------------------------------------------------------------------------
+// Bulk word transfers via ID_DAP_TRANSFER_BLOCK: one 5-byte header moves up to
+// ~250 words and the probe executes them in a tight loop, instead of the
+// per-word request dispatch of ID_DAP_TRANSFER (which measures ~an order of
+// magnitude slower per word on the frog). TAR is re-set with a small
+// ID_DAP_TRANSFER packet at each 1 KB auto-increment boundary, and everything
+// is pipelined through the same submit/reap window as dap_transfer.
+
+#define BULK_BLOCK_WORDS  128   // two blocks per 1 KB TAR segment; fits any report size >= 549
+
+typedef struct
+{
+  uint8_t   cmd;      // expected response echo: ID_DAP_TRANSFER or ID_DAP_TRANSFER_BLOCK
+  uint16_t  count;    // expected op/word count in the response
+  uint32_t  *dst;     // destination for read data (NULL for writes/setup)
+  uint32_t  addr;     // target address (diagnostics)
+  uint32_t  seq;      // global packet sequence (diagnostics)
+} bulk_slot_t;
+
+static uint32_t bulk_seq;
+
+static bulk_slot_t bulk_slot[DAP_PIPELINE_DEPTH];
+static int bulk_head, bulk_tail, bulk_inflight;
+
+static bool bulk_reap_one(void)
+{
+  static uint8_t resp[TRANSFER_BUF_SIZE];
+  bulk_slot_t *slot = &bulk_slot[bulk_head];
+  int count, status;
+
+  int res = dbg_dap_cmd_reap_try(slot->cmd, resp, sizeof(resp));
+
+  if (res < 0)
+  {
+    bulk_head = (bulk_head + 1) % DAP_PIPELINE_DEPTH;
+    bulk_inflight--;
+    return false;
+  }
+
+  if (ID_DAP_TRANSFER == slot->cmd)
+  {
+    count  = resp[0];
+    status = resp[1];
+  }
+  else
+  {
+    count  = resp[0] | (resp[1] << 8);
+    status = resp[2];
+  }
+
+  bulk_head = (bulk_head + 1) % DAP_PIPELINE_DEPTH;
+  bulk_inflight--;
+
+  if (slot->count != count || DAP_TRANSFER_OK != status)
+  {
+    if (NULL != getenv("EDBG_DEBUG_TRANSIENTS"))
+      warning("bulk transient: seq=%u addr=0x%08x cmd=0x%02x count=%d/%d status=%d\n",
+          slot->seq, slot->addr, slot->cmd, count, slot->count, status);
+    return false;
+  }
+
+  if (slot->dst)
+    memcpy(slot->dst, &resp[3], count * sizeof(uint32_t));
+
+  return true;
+}
+
+static bool bulk_failed;
+
+static int bulk_window(void)
+{
+  static int window = 0;
+
+  if (0 == window)
+  {
+    // Default to ONE packet in flight for fleet compatibility: pre-v7 fp2-dap
+    // probe firmware has a USB ring race with >=2 outstanding packets, and
+    // most probes still run it. On a rig with updated probe firmware, the
+    // bench-mapped stable pipelined operating point is EDBG_BULK_WINDOW=4
+    // with -c 12500 (storms live at delay<=10; delay 12 = 12.5MHz is solid --
+    // see windborne/edbg#1 for the full characterization).
+    char *env = getenv("EDBG_BULK_WINDOW");
+    window = env ? atoi(env) : 1;
+    if (window < 1 || window > DAP_PIPELINE_DEPTH)
+      window = 1;
+  }
+
+  return window;
+}
+
+static uint32_t bulk_cur_addr;   // set by dap_block_attempt around submits
+
+static void bulk_submit(uint8_t cmd, uint16_t count, uint32_t *dst, uint8_t *pkt, int pkt_size)
+{
+  while (bulk_inflight >= bulk_window())
+    if (!bulk_reap_one())
+      bulk_failed = true;
+
+  bulk_slot[bulk_tail].cmd   = cmd;
+  bulk_slot[bulk_tail].count = count;
+  bulk_slot[bulk_tail].dst   = dst;
+  bulk_slot[bulk_tail].addr  = bulk_cur_addr;
+  bulk_slot[bulk_tail].seq   = bulk_seq++;
+  bulk_tail = (bulk_tail + 1) % DAP_PIPELINE_DEPTH;
+  bulk_inflight++;
+
+  dbg_dap_cmd_submit(pkt, pkt_size);
+}
+
+// One attempt of a bulk transfer; false on any transient (mismatched echo, bad
+// count/status). This path only ever moves idempotent data (flash reads, SRAM
+// staging) -- never flash-state operations -- so callers drain and retry.
+static bool dap_block_attempt(uint32_t addr, uint8_t *data, int size, bool write)
+{
+  static uint8_t pkt[TRANSFER_BUF_SIZE];
+  uint32_t *buf = (uint32_t *)data;
+  int words = size / (int)sizeof(uint32_t);
+  bool first = true;
+
+  assert((addr % sizeof(uint32_t)) == 0 && (size % sizeof(uint32_t)) == 0);
+
+  bulk_head = bulk_tail = bulk_inflight = 0;
+  bulk_failed = false;
+
+  while (words > 0)
+  {
+    bulk_cur_addr = addr;
+
+    // Words until the next 1 KB auto-increment boundary
+    int seg = (0x400 - (addr & 0x3ff)) / 4;
+    if (seg > words)
+      seg = words;
+
+    // TAR (and CSW, once) via a small regular transfer packet
+    {
+      int n = 0, ops = 0;
+
+      pkt[n++] = ID_DAP_TRANSFER;
+      pkt[n++] = dap_jtag_index;
+      pkt[n++] = 0; // placeholder
+
+      if (first)
+      {
+        uint32_t csw = AP_CSW_DBGSWENABLE | AP_CSW_PROT(0x23) | AP_CSW_SIZE_WORD | AP_CSW_ADDRINC_SINGLE;
+        pkt[n++] = SWD_AP_CSW;
+        pkt[n++] = csw & 0xff; pkt[n++] = (csw >> 8) & 0xff;
+        pkt[n++] = (csw >> 16) & 0xff; pkt[n++] = (csw >> 24) & 0xff;
+        ops++;
+        first = false;
+      }
+
+      pkt[n++] = SWD_AP_TAR;
+      pkt[n++] = addr & 0xff; pkt[n++] = (addr >> 8) & 0xff;
+      pkt[n++] = (addr >> 16) & 0xff; pkt[n++] = (addr >> 24) & 0xff;
+      ops++;
+
+      pkt[2] = ops;
+      bulk_submit(ID_DAP_TRANSFER, ops, NULL, pkt, n);
+    }
+
+    // The segment's words as TransferBlock packets
+    while (seg > 0)
+    {
+      int blk = (seg > BULK_BLOCK_WORDS) ? BULK_BLOCK_WORDS : seg;
+      int n = 0;
+
+      pkt[n++] = ID_DAP_TRANSFER_BLOCK;
+      pkt[n++] = dap_jtag_index;
+      pkt[n++] = blk & 0xff;
+      pkt[n++] = (blk >> 8) & 0xff;
+      pkt[n++] = write ? SWD_AP_DRW : (SWD_AP_DRW | DAP_TRANSFER_RnW);
+
+      if (write)
+      {
+        memcpy(&pkt[n], buf, blk * sizeof(uint32_t));
+        n += blk * sizeof(uint32_t);
+      }
+
+      bulk_submit(ID_DAP_TRANSFER_BLOCK, blk, write ? NULL : buf, pkt, n);
+
+      buf   += blk;
+      addr  += blk * sizeof(uint32_t);
+      seg   -= blk;
+      words -= blk;
+    }
+  }
+
+  while (bulk_inflight > 0)
+    if (!bulk_reap_one())
+      bulk_failed = true;
+
+  // Our TAR/CSW writes bypassed dap_transfer's cached state: force the next
+  // regular transfer to re-establish both.
+  dap_set_address = true;
+  dap_csw = 0;
+
+  return !bulk_failed;
+}
+
+static void dap_block_xfer(uint32_t addr, uint8_t *data, int size, bool write)
+{
+  for (int attempt = 0; attempt < 3; attempt++)
+  {
+    if (dap_block_attempt(addr, data, size, write))
+    {
+      if (attempt > 0)
+        verbose("~");   // retried transient -- visible, non-fatal
+      return;
+    }
+
+    // Response stream may be desynced: whatever was owed has been reaped
+    // tolerantly by the attempt's drain; just start the transfer over.
+  }
+
+  error_exit("block transfer failed after 3 attempts: is the board turned on?");
+}
+
+void dap_block_write(uint32_t addr, uint8_t *data, int size)
+{
+  dap_block_xfer(addr, data, size, true);
+}
+
+void dap_block_read(uint32_t addr, uint8_t *data, int size)
+{
+  dap_block_xfer(addr, data, size, false);
 }
 
 //-----------------------------------------------------------------------------

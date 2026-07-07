@@ -34,6 +34,9 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -159,6 +162,30 @@ void dbg_open(debugger_t *debugger)
   if (debugger_fd < 0)
     error_exit("unable to open device %s: %s",  debugger->path, strerror(errno));
 
+  // Exclusive advisory lock on the probe: two concurrent sessions (a second
+  // edbg, or an oc mux/power command mid-flash) interleave commands on the
+  // same USB pipe and corrupt both the protocol stream and the target flash.
+  // flock() is held for the life of this process and released by the kernel
+  // on any exit, so it cannot go stale. Grace period lets a quick command
+  // (mux set, identify) finish before we give up.
+  // EDBG_LOCK_INHERITED=1: our parent (oc) already holds the lock and keeps
+  // it for our whole lifetime (mux/power + flash as one atomic sequence);
+  // taking it here would deadlock against our own caller.
+  for (int tries = 0; (NULL == getenv("EDBG_LOCK_INHERITED")) &&
+      flock(debugger_fd, LOCK_EX | LOCK_NB) < 0; tries++)
+  {
+    if (tries >= 20)
+    {
+      // Not error_exit(): its cleanup tries to send a disconnect command to
+      // the device we never initialized (report_size is still 0).
+      fprintf(stderr, "Error: probe %s is in use by another session "
+          "(edbg or oc); refusing to interleave commands\n", debugger->path);
+      close(debugger_fd);
+      exit(1);
+    }
+    usleep(100 * 1000);
+  }
+
   memset(&rpt_desc, 0, sizeof(rpt_desc));
   memset(&info, 0, sizeof(info));
 
@@ -172,6 +199,14 @@ void dbg_open(debugger_t *debugger)
     perror_exit("debugger ioctl()");
 
   report_size = parse_hid_report_desc(rpt_desc.value, rpt_desc.size);
+
+  // Drain any stale input reports (e.g. responses to pipelined requests from a
+  // session that exited mid-window), so the first command of this session does
+  // not consume a leftover response.
+  int flags = fcntl(debugger_fd, F_GETFL, 0);
+  fcntl(debugger_fd, F_SETFL, flags | O_NONBLOCK);
+  while (read(debugger_fd, hid_buffer, sizeof(hid_buffer)) > 0);
+  fcntl(debugger_fd, F_SETFL, flags);
 }
 
 //-----------------------------------------------------------------------------
@@ -201,6 +236,60 @@ int dbg_dap_cmd(uint8_t *data, int resp_size, int req_size)
   res = write(debugger_fd, hid_buffer, report_size + 1);
   if (res < 0)
     perror_exit("debugger write()");
+
+  res = read(debugger_fd, hid_buffer, report_size + 1);
+  if (res < 0)
+    perror_exit("debugger read()");
+
+  check(res, "empty response received");
+
+  check(hid_buffer[0] == cmd, "invalid response received");
+
+  res--;
+  memcpy(data, &hid_buffer[1], (resp_size < res) ? resp_size : res);
+
+  return res;
+}
+
+//-----------------------------------------------------------------------------
+void dbg_dap_cmd_submit(uint8_t *data, int req_size)
+{
+  int res;
+
+  memset(hid_buffer, 0xff, report_size + 1);
+
+  hid_buffer[0] = 0x00; // Report ID
+  memcpy(&hid_buffer[1], data, req_size);
+
+  res = write(debugger_fd, hid_buffer, report_size + 1);
+  if (res < 0)
+    perror_exit("debugger write()");
+}
+
+//-----------------------------------------------------------------------------
+// Like dbg_dap_cmd_reap but returns -1 on a mismatched/empty response instead
+// of exiting -- lets idempotent bulk transfers drain and retry transients.
+int dbg_dap_cmd_reap_try(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  int res;
+
+  res = read(debugger_fd, hid_buffer, report_size + 1);
+  if (res <= 0)
+    return -1;
+
+  if (hid_buffer[0] != cmd)
+    return -1;
+
+  res--;
+  memcpy(data, &hid_buffer[1], (resp_size < res) ? resp_size : res);
+
+  return res;
+}
+
+//-----------------------------------------------------------------------------
+int dbg_dap_cmd_reap(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  int res;
 
   res = read(debugger_fd, hid_buffer, report_size + 1);
   if (res < 0)
