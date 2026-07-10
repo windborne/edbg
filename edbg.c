@@ -626,7 +626,11 @@ int main(int argc, char **argv)
 
   reconnect_debugger();
 
-  target_ops->select(&g_target_options);
+  // Flashing does its select() inside the retry block below (so a transient
+  // connect failure on a marginal cable retries with the rest); other ops
+  // select once here.
+  if (!(g_target_options.program || g_target_options.verify))
+    target_ops->select(&g_target_options);
 
   if (g_target_options.unlock)
   {
@@ -674,10 +678,12 @@ int main(int argc, char **argv)
           wait_ms, attempt + 1, flash_max);
       sleep_ms(wait_ms);
       reconnect_debugger();
-      target_ops->select(&g_target_options);
     }
 
     g_flash_retries_left = (attempt + 1 < flash_max);
+
+    // Inside the retry region: a select failure now reconnects and re-runs too.
+    target_ops->select(&g_target_options);
 
     if (g_target_options.program)
     {

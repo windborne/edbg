@@ -229,6 +229,8 @@ static void flash_wait_done(void)
     error_exit("flash operation failed. FLASH_NSSR = 0x%08x", sr);
 }
 
+extern uint32_t dap_last_clock;   // last clock set via dap_swj_clock (dap.c)
+
 //-----------------------------------------------------------------------------
 static void target_select(target_options_t *options)
 {
@@ -238,6 +240,24 @@ static void target_select(target_options_t *options)
   dap_disconnect();
   dap_connect(DAP_INTERFACE_SWD);
   dap_reset_pin(0);
+
+  // Marginal/AC-coupled cable: a DP hard-wedged by a prior failed flash is NOT
+  // cleared by a single link reset at the flash clock -- the reset sequence is
+  // a sustained-high level the AC coupling attenuates, so it must run slow and
+  // repeated (this is exactly what the standalone unwedge helper does, and why
+  // it recovers where edbg's connect used to give up). Do it here so the driver
+  // self-recovers with no external helper. Harmless on a clean cable (one extra
+  // reset). Restore the flash clock afterward.
+  {
+    uint32_t flash_clock = dap_last_clock ? dap_last_clock : 8000000;
+    for (int i = 0; i < 6; i++)
+    {
+      dap_swj_clock(2000000);
+      dap_reset_link();
+      sleep_ms(20);
+    }
+    dap_swj_clock(flash_clock);
+  }
   dap_reset_link();
 
   // Stop the core (reset-catch: halt out of SYSRESETREQ before any user code runs)
