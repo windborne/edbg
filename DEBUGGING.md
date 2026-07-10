@@ -180,19 +180,38 @@ pairs, which have **AC-coupling capacitors** by spec. That makes the link a
 - **Reflection notch:** a sharp dead band (bench: ~9 MHz) where every transfer
   fails, clean again just above and below.
 
-Usable passband ≈ 3–8 MHz; **8 MHz measured the lowest glitch rate** — use it
-(`-c 8000`). Diagnose with the read clock-response: if reads fail *low* and
-pass *high*, it's AC-coupled — do NOT drop the clock.
+Usable passband ≈ 3–8 MHz; **8 MHz measured the lowest glitch rate**. The
+stm32u5 driver now **defaults to 8 MHz** whenever `-c` is not passed (16 MHz is
+edbg's global default but measured **0/8** full flashes here vs **10/10** at
+8 MHz), so `oc` and bare `edbg` are both safe out of the box; pass `-c` to
+override. Diagnose with the read clock-response: if reads fail *low* and pass
+*high*, it's AC-coupled — do NOT drop the clock below ~4 MHz.
 
-Rare in-band line-noise glitches still desync the DP into an `ack=7` latch, and
-critically a normal recovery is weakened here (a line reset is a sustained-high
-level the AC caps attenuate). The driver handles this itself now (no external
-unwedge needed): latch-free transfer retry that **re-syncs at 2 MHz** (the
-host-driven reset sequence survives slow) then restores the flash clock, plus a
-self-healing verify (differential re-flash of corrupted pages) and a top-level
-reconnect+re-run to outlast multi-second bursts. Tunables: `EDBG_BLOCK_RETRIES`,
-`EDBG_FLASH_RETRIES`. What's left after all that is sustained EMI bursts — a
-hardware limit of the cable, not the tool.
+### The actual root cause: a WDATAERR latch the recovery couldn't clear
+
+The real reason block-4 boards "wouldn't flash over the long cable" was **not**
+raw signal integrity — it was a latent bug in the DP recovery, exposed by the
+cable. A write's data phase over the long link occasionally picks up a parity
+glitch; the DP latches `CTRL/STAT.WDATAERR` (bit 7) and then **FAULTs every
+subsequent write** until it is cleared with `ABORT.WDERRCLR` (bit 3). edbg's
+`dap_reset_link` ABORT mask was the classic `STKCMPCLR|STKERRCLR|ORUNERRCLR`
+(0x16) — **missing WDERRCLR** — so recovery re-synced the link but never cleared
+WDATAERR, and one glitched write wedged the DP forever (`transfer failed after
+N attempts … cable may be unusable`). It's cable-length dependent purely because
+a short cable rarely sets WDATAERR, so the omission never bit. Fix: the ABORT now
+clears **all** sticky flags incl. `WDERRCLR` (plus `DAPABORT` to drop any stuck
+AP transaction). Confirmed on the bench: CTRL/STAT reads `0xf00000c0` (WDATAERR
+set) after a glitch; ABORT=0x16 → FAULT, WDATAERR stays; ABORT=0x1e/0x1f → OK,
+WDATAERR cleared.
+
+On top of that base fix, the driver self-heals the rare in-band glitch without
+any external unwedge: latch-free transfer retry (a single WDERRCLR-capable
+`dap_reset_link` between tries), a self-healing verify (differential re-flash of
+corrupted pages), and a top-level reconnect+re-run to outlast multi-second
+bursts. Tunables: `EDBG_BLOCK_RETRIES`, `EDBG_FLASH_RETRIES`;
+`EDBG_DEBUG_XFER=1` traces every transfer + dumps the failing batch. What's left
+after all that is sustained EMI bursts — a hardware limit of the cable, not the
+tool.
 
 ## DP wedge recovery
 

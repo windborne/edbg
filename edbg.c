@@ -86,6 +86,7 @@ static bool g_list = false;
 static char *g_target = NULL;
 static bool g_verbose = false;
 static long g_clock = 16000000;
+bool g_clock_explicit = false;   // set when the user passes -c; targets may pick a safe default otherwise
 static debugger_t *g_debugger = NULL;
 
 static target_options_t g_target_options =
@@ -526,7 +527,7 @@ static void parse_command_line(int argc, char **argv)
       case 't': g_target = optarg; break;
       case 'l': g_list = true; break;
       case 's': g_serial = optarg; break;
-      case 'c': g_clock = strtoul(optarg, NULL, 0) * 1000; break;
+      case 'c': g_clock = strtoul(optarg, NULL, 0) * 1000; g_clock_explicit = true; break;
       case 'b': g_verbose = true; break;
       case 'o': g_target_options.offset = (uint32_t)strtoul(optarg, NULL, 0); break;
       case 'z': g_target_options.size = (uint32_t)strtoul(optarg, NULL, 0); break;

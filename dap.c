@@ -460,8 +460,17 @@ void dap_reset_link(void)
     error_exit("no interface selected in dap_reset_link()");
   }
 
+  // Clear ALL sticky error flags, including WDERRCLR. On a long/marginal cable a
+  // write's data phase can pick up a parity glitch, which latches CTRL/STAT.WDATAERR;
+  // while WDATAERR is set the DP FAULTs *every* subsequent write. Omitting WDERRCLR
+  // here (the classic edbg mask) means the recovery ABORT can never clear it, so one
+  // corrupted write wedges the link forever ("cable unusable"). DAPABORT also drops
+  // any AP transaction left in flight by the glitch. This is why the failure is
+  // cable-length dependent: on a short cable WDATAERR rarely sets, so the omission
+  // never bites.
   dap_add_req(TRANSFER_TYPE_WRITE_REG, TRANSFER_SIZE_WORD, SWD_DP_W_ABORT,
-      DP_ABORT_STKCMPCLR | DP_ABORT_STKERRCLR | DP_ABORT_ORUNERRCLR);
+      DP_ABORT_DAPABORT | DP_ABORT_STKCMPCLR | DP_ABORT_STKERRCLR |
+      DP_ABORT_WDERRCLR | DP_ABORT_ORUNERRCLR);
   dap_add_req(TRANSFER_TYPE_WRITE_REG, TRANSFER_SIZE_WORD, SWD_DP_W_SELECT,
       DP_SELECT_APBANKSEL(0) | DP_SELECT_APSEL(0));
   dap_add_req(TRANSFER_TYPE_WRITE_REG, TRANSFER_SIZE_WORD, SWD_DP_W_CTRL_STAT,
@@ -890,6 +899,15 @@ static void dap_recover(int attempt)
 
 void dap_transfer(void)
 {
+  if (NULL != getenv("EDBG_DEBUG_XFER"))
+  {
+    fprintf(stderr, "xfer[%d]:", dap_request_count);
+    for (int i = 0; i < dap_request_count && i < 6; i++)
+      fprintf(stderr, " {t%d s%d a=0x%08x d=0x%08x}", dap_request[i].type,
+          dap_request[i].size, dap_request[i].addr, dap_request[i].data);
+    fprintf(stderr, "\n");
+  }
+
   if (dap_in_recovery)
   {
     dap_transfer_once();
@@ -918,6 +936,14 @@ void dap_transfer(void)
       dap_recover(attempt);
   }
 
+  if (NULL != getenv("EDBG_DEBUG_XFER"))
+  {
+    fprintf(stderr, "FAILED batch [%d]:", saved_count);
+    for (int i = 0; i < saved_count && i < 6; i++)
+      fprintf(stderr, " {t%d s%d a=0x%08x d=0x%08x}", saved[i].type,
+          saved[i].size, saved[i].addr, saved[i].data);
+    fprintf(stderr, "\n");
+  }
   error_exit("transfer failed after %d attempts with link re-sync: "
       "cable may be unusable at this clock", retries);
 }
@@ -1175,65 +1201,6 @@ void dap_block_write(uint32_t addr, uint8_t *data, int size)
 void dap_block_read(uint32_t addr, uint8_t *data, int size)
 {
   dap_block_xfer(addr, data, size, false);
-}
-
-//-----------------------------------------------------------------------------
-// Auto-select the flash clock for the attached cable. Probes candidate clocks
-// (must be sorted FASTEST-first) with a small random-data write+readback to a
-// scratch SRAM address, and returns the fastest clock that transfers cleanly.
-// The data is deliberately RANDOM (broadband): it exercises the AC-coupling
-// high-pass and the cable-RC low-pass at once, so a clock that would pass a
-// constant-register read yet corrupt real flash data (16 MHz on an AC-coupled
-// cable) is correctly rejected. dap_block_attempt is non-fatal, so a bad clock
-// just marks the candidate dirty; the DP is re-synced (2 MHz) between
-// candidates in case a bad clock wedged it. Selection = "highest clean clock":
-// clean cable -> top candidate (fast); AC-coupled -> the passband; resistive
-// long cable -> whatever passes; the ~9 MHz reflection notch is never a
-// candidate so it can't be picked.
-uint32_t dap_probe_clock(const uint32_t *cands, int n, uint32_t scratch)
-{
-  static uint8_t pat[512], rd[512];
-  uint32_t seed = 0x2545f491u;
-  uint32_t chosen = cands[n - 1];   // fallback: slowest candidate
-
-  for (int i = 0; i < (int)sizeof(pat); i++)
-  {
-    seed = seed * 1103515245u + 12345u;
-    pat[i] = (uint8_t)(seed >> 15);
-  }
-
-  for (int i = 0; i < n; i++)
-  {
-    bool clean = true;
-
-    dap_swj_clock(cands[i]);
-    dap_set_address = true;
-    dap_csw = 0;
-
-    for (int rep = 0; rep < 6 && clean; rep++)
-    {
-      if (!dap_block_attempt(scratch, pat, (int)sizeof(pat), true)) { clean = false; break; }
-      if (!dap_block_attempt(scratch, rd, (int)sizeof(rd), false))  { clean = false; break; }
-      for (int k = 0; k < (int)sizeof(pat); k++)
-        if (pat[k] != rd[k]) { clean = false; break; }
-    }
-
-    if (NULL != getenv("EDBG_DEBUG_STUBS"))
-      warning("clock probe %u MHz: %s\n", cands[i] / 1000000u, clean ? "clean" : "dirty");
-
-    if (clean)
-    {
-      chosen = cands[i];
-      break;
-    }
-
-    dap_recover(0);   // a bad clock can wedge the DP; re-sync before the next
-  }
-
-  dap_swj_clock(chosen);
-  dap_set_address = true;
-  dap_csw = 0;
-  return chosen;
 }
 
 //-----------------------------------------------------------------------------

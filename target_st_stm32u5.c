@@ -229,7 +229,7 @@ static void flash_wait_done(void)
     error_exit("flash operation failed. FLASH_NSSR = 0x%08x", sr);
 }
 
-extern uint32_t dap_last_clock;   // last clock set via dap_swj_clock (dap.c)
+extern bool g_clock_explicit;   // true if the user passed -c (edbg.c)
 
 //-----------------------------------------------------------------------------
 static void target_select(target_options_t *options)
@@ -248,34 +248,22 @@ static void target_select(target_options_t *options)
   // already-running app is safe for flashing.
   bool gentle_halt = (NULL != getenv("EDBG_U5_GENTLE_HALT"));
 
+  // Default to 8 MHz unless the user set -c explicitly. edbg's global default is
+  // 16 MHz, which is in this cable's stop-band: over a long/AC-coupled USB-C link
+  // reads pass but bulk writes corrupt ~100% (measured 0/8 full flashes at 16 MHz
+  // vs 10/10 at 8 MHz). 8 MHz is in the passband and is safe on a short cable too
+  // -- a full ~0.5 MB flash+verify is ~1.6 s. Set before the reset-catch so the
+  // timing-critical connect also runs in-band.
+  if (!g_clock_explicit)
+    dap_swj_clock(8000000);
+
   if (!gentle_halt)
     dap_reset_pin(0);
 
-  // Auto-clock: bring the link up at a safe passband clock. The requested clock
-  // may be the harmful default (16 MHz corrupts an AC-coupled cable), which
-  // would fail the connect/reset-catch before the probe below could lower it.
-  // 8 MHz is in-band for clean and AC-coupled cables alike; the probe refines
-  // from there (up to 16 on a clean cable, down within the passband otherwise).
-  if (NULL != getenv("EDBG_U5_AUTO_CLOCK"))
-    dap_swj_clock(8000000);
-
-  // Marginal/AC-coupled cable: a DP hard-wedged by a prior failed flash is NOT
-  // cleared by a single link reset at the flash clock -- the reset sequence is
-  // a sustained-high level the AC coupling attenuates, so it must run slow and
-  // repeated (this is exactly what the standalone unwedge helper does, and why
-  // it recovers where edbg's connect used to give up). Do it here so the driver
-  // self-recovers with no external helper. Harmless on a clean cable (one extra
-  // reset). Restore the flash clock afterward.
-  {
-    uint32_t flash_clock = dap_last_clock ? dap_last_clock : 8000000;
-    for (int i = 0; i < 6; i++)
-    {
-      dap_swj_clock(4000000);   // passband recovery (2 MHz is at/below the AC corner)
-      dap_reset_link();
-      sleep_ms(20);
-    }
-    dap_swj_clock(flash_clock);
-  }
+  // One link reset re-syncs the DP. Its ABORT clears CTRL/STAT.WDATAERR, so a
+  // write-parity glitch latched by the marginal cable no longer wedges the link
+  // (that latch, from an ABORT mask missing WDERRCLR, was the real long-cable
+  // failure). A rare reset-catch glitch is caught by edbg's top-level reconnect.
   dap_reset_link();
 
   // Stop the core. Reset-catch (default) halts out of SYSRESETREQ before any
@@ -295,20 +283,6 @@ static void target_select(target_options_t *options)
   dap_write_word(DBGMCU_CR, DBGMCU_CR_DBG_LP);
 
   idcode = dap_read_word(DBGMCU_IDCODE);
-
-  // Auto-select the flash clock for whatever cable is attached (opt-in via
-  // EDBG_U5_AUTO_CLOCK). The default 16 MHz corrupts an AC-coupled long cable
-  // (writes fail while reads pass), so probe candidates with real broadband
-  // data and pick the fastest clean one -- 16 MHz on a clean cable, ~8 MHz on
-  // an AC-coupled one -- with no user tuning. Runs here, AFTER the reset-catch
-  // halts the core, so the scratch SRAM word is stable (a running app would
-  // otherwise race the readback and every candidate would look dirty).
-  if (NULL != getenv("EDBG_U5_AUTO_CLOCK"))
-  {
-    static const uint32_t clock_cands[] = { 16000000, 12000000, 10000000, 8000000, 6000000 };
-    uint32_t sel = dap_probe_clock(clock_cands, (int)ARRAY_SIZE(clock_cands), SRAM_ADDR + 0x100);
-    verbose("auto-clock: %u kHz\n", sel / 1000);
-  }
 
   for (int i = 0; i < ARRAY_SIZE(devices); i++)
   {
