@@ -1172,6 +1172,65 @@ void dap_block_read(uint32_t addr, uint8_t *data, int size)
 }
 
 //-----------------------------------------------------------------------------
+// Auto-select the flash clock for the attached cable. Probes candidate clocks
+// (must be sorted FASTEST-first) with a small random-data write+readback to a
+// scratch SRAM address, and returns the fastest clock that transfers cleanly.
+// The data is deliberately RANDOM (broadband): it exercises the AC-coupling
+// high-pass and the cable-RC low-pass at once, so a clock that would pass a
+// constant-register read yet corrupt real flash data (16 MHz on an AC-coupled
+// cable) is correctly rejected. dap_block_attempt is non-fatal, so a bad clock
+// just marks the candidate dirty; the DP is re-synced (2 MHz) between
+// candidates in case a bad clock wedged it. Selection = "highest clean clock":
+// clean cable -> top candidate (fast); AC-coupled -> the passband; resistive
+// long cable -> whatever passes; the ~9 MHz reflection notch is never a
+// candidate so it can't be picked.
+uint32_t dap_probe_clock(const uint32_t *cands, int n, uint32_t scratch)
+{
+  static uint8_t pat[512], rd[512];
+  uint32_t seed = 0x2545f491u;
+  uint32_t chosen = cands[n - 1];   // fallback: slowest candidate
+
+  for (int i = 0; i < (int)sizeof(pat); i++)
+  {
+    seed = seed * 1103515245u + 12345u;
+    pat[i] = (uint8_t)(seed >> 15);
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    bool clean = true;
+
+    dap_swj_clock(cands[i]);
+    dap_set_address = true;
+    dap_csw = 0;
+
+    for (int rep = 0; rep < 6 && clean; rep++)
+    {
+      if (!dap_block_attempt(scratch, pat, (int)sizeof(pat), true)) { clean = false; break; }
+      if (!dap_block_attempt(scratch, rd, (int)sizeof(rd), false))  { clean = false; break; }
+      for (int k = 0; k < (int)sizeof(pat); k++)
+        if (pat[k] != rd[k]) { clean = false; break; }
+    }
+
+    if (NULL != getenv("EDBG_DEBUG_STUBS"))
+      warning("clock probe %u MHz: %s\n", cands[i] / 1000000u, clean ? "clean" : "dirty");
+
+    if (clean)
+    {
+      chosen = cands[i];
+      break;
+    }
+
+    dap_recover(0);   // a bad clock can wedge the DP; re-sync before the next
+  }
+
+  dap_swj_clock(chosen);
+  dap_set_address = true;
+  dap_csw = 0;
+  return chosen;
+}
+
+//-----------------------------------------------------------------------------
 uint8_t dap_read_byte(uint32_t addr)
 {
   dap_read_byte_req(addr);

@@ -260,6 +260,20 @@ static void target_select(target_options_t *options)
   }
   dap_reset_link();
 
+  // Auto-select the flash clock for whatever cable is attached (opt-in via
+  // EDBG_U5_AUTO_CLOCK). The default 16 MHz corrupts an AC-coupled long cable
+  // (writes fail while reads pass), so probe candidates with real broadband
+  // data and pick the fastest clean one -- 16 MHz on a clean cable, ~8 MHz on
+  // an AC-coupled one -- with no user tuning. Probes core-running against a
+  // scratch word in the stub arena (which the flash clobbers anyway); a
+  // transient race only ever yields a conservative "dirty".
+  if (NULL != getenv("EDBG_U5_AUTO_CLOCK"))
+  {
+    static const uint32_t clock_cands[] = { 16000000, 12000000, 10000000, 8000000, 6000000 };
+    uint32_t sel = dap_probe_clock(clock_cands, (int)ARRAY_SIZE(clock_cands), SRAM_ADDR + 0x100);
+    verbose("auto-clock: %u kHz\n", sel / 1000);
+  }
+
   // Stop the core (reset-catch: halt out of SYSRESETREQ before any user code runs)
   dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);
   dap_write_word(DEMCR, DEMCR_VC_CORERESET);

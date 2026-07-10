@@ -98,6 +98,7 @@ void dap_write_block(uint32_t addr, uint8_t *data, int size);
  * the probe loops per word instead of dispatching per request — much faster).
  * Pipelined; re-TARs at 1 KB auto-increment boundaries. Word-aligned only. */
 void dap_block_read(uint32_t addr, uint8_t *data, int size);
+uint32_t dap_probe_clock(const uint32_t *cands, int n, uint32_t scratch);
 void dap_block_write(uint32_t addr, uint8_t *data, int size);
 
 void dap_read_byte_req(uint32_t addr);
