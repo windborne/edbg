@@ -399,11 +399,17 @@ void dap_reset_link(void)
       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
     };
 
-    buf[0] = ID_DAP_SWJ_SEQUENCE;
-    buf[1] = sizeof(dormant_alert) * 8;   // 224
-    memcpy(&buf[2], dormant_alert, sizeof(dormant_alert));
-    dbg_dap_cmd(buf, sizeof(buf), 2 + sizeof(dormant_alert));
-    check(DAP_OK == buf[0], "SWJ_SEQUENCE (dormant alert) failed");
+    // On a marginal cable the alert sequence itself can be corrupted and knock
+    // a healthy DP into a bad state (the reverse of its intent). EDBG_NO_DORMANT
+    // skips it -- a plain line reset then suffices for a non-dormant DP.
+    if (NULL == getenv("EDBG_NO_DORMANT"))
+    {
+      buf[0] = ID_DAP_SWJ_SEQUENCE;
+      buf[1] = sizeof(dormant_alert) * 8;   // 224
+      memcpy(&buf[2], dormant_alert, sizeof(dormant_alert));
+      dbg_dap_cmd(buf, sizeof(buf), 2 + sizeof(dormant_alert));
+      check(DAP_OK == buf[0], "SWJ_SEQUENCE (dormant alert) failed");
+    }
 
     buf[0] = ID_DAP_SWJ_SEQUENCE;
     buf[1] = (7 + 2 + 7 + 1) * 8;
@@ -872,9 +878,9 @@ static void dap_recover(int attempt)
 
   dap_request_count = 0;   // dap_reset_link builds its own batch from empty
   dap_in_recovery = true;
-  dap_swj_clock(2000000);
+  dap_swj_clock(4000000);   // passband recovery clock (2 MHz is at/below the AC-coupling corner on a long USB-C cable)
   dap_reset_link();
-  if (flash_clock && flash_clock != 2000000)
+  if (flash_clock && flash_clock != 4000000)
     dap_swj_clock(flash_clock);
   dap_in_recovery = false;
 

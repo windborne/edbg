@@ -239,7 +239,25 @@ static void target_select(target_options_t *options)
 
   dap_disconnect();
   dap_connect(DAP_INTERFACE_SWD);
-  dap_reset_pin(0);
+
+  // Gentle-halt mode (EDBG_U5_GENTLE_HALT): attach to the running core and just
+  // halt it, instead of the reset-catch (nRESET + SYSRESETREQ + vector-catch).
+  // On a marginal/long cable the reset-catch is the timing-critical step that
+  // fails while steady SWD traffic works fine; a plain attach connects
+  // reliably. The driver feeds the IWDG during programming, so halting an
+  // already-running app is safe for flashing.
+  bool gentle_halt = (NULL != getenv("EDBG_U5_GENTLE_HALT"));
+
+  if (!gentle_halt)
+    dap_reset_pin(0);
+
+  // Auto-clock: bring the link up at a safe passband clock. The requested clock
+  // may be the harmful default (16 MHz corrupts an AC-coupled cable), which
+  // would fail the connect/reset-catch before the probe below could lower it.
+  // 8 MHz is in-band for clean and AC-coupled cables alike; the probe refines
+  // from there (up to 16 on a clean cable, down within the passband otherwise).
+  if (NULL != getenv("EDBG_U5_AUTO_CLOCK"))
+    dap_swj_clock(8000000);
 
   // Marginal/AC-coupled cable: a DP hard-wedged by a prior failed flash is NOT
   // cleared by a single link reset at the flash clock -- the reset sequence is
@@ -252,7 +270,7 @@ static void target_select(target_options_t *options)
     uint32_t flash_clock = dap_last_clock ? dap_last_clock : 8000000;
     for (int i = 0; i < 6; i++)
     {
-      dap_swj_clock(2000000);
+      dap_swj_clock(4000000);   // passband recovery (2 MHz is at/below the AC corner)
       dap_reset_link();
       sleep_ms(20);
     }
@@ -260,32 +278,37 @@ static void target_select(target_options_t *options)
   }
   dap_reset_link();
 
+  // Stop the core. Reset-catch (default) halts out of SYSRESETREQ before any
+  // user code runs; gentle-halt just stops the already-running core.
+  dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);
+
+  if (!gentle_halt)
+  {
+    dap_write_word(DEMCR, DEMCR_VC_CORERESET);
+    dap_write_word(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ);
+
+    dap_reset_pin(1);
+    sleep_ms(10);
+  }
+
+  // Keep the debug interface alive across low-power states
+  dap_write_word(DBGMCU_CR, DBGMCU_CR_DBG_LP);
+
+  idcode = dap_read_word(DBGMCU_IDCODE);
+
   // Auto-select the flash clock for whatever cable is attached (opt-in via
   // EDBG_U5_AUTO_CLOCK). The default 16 MHz corrupts an AC-coupled long cable
   // (writes fail while reads pass), so probe candidates with real broadband
   // data and pick the fastest clean one -- 16 MHz on a clean cable, ~8 MHz on
-  // an AC-coupled one -- with no user tuning. Probes core-running against a
-  // scratch word in the stub arena (which the flash clobbers anyway); a
-  // transient race only ever yields a conservative "dirty".
+  // an AC-coupled one -- with no user tuning. Runs here, AFTER the reset-catch
+  // halts the core, so the scratch SRAM word is stable (a running app would
+  // otherwise race the readback and every candidate would look dirty).
   if (NULL != getenv("EDBG_U5_AUTO_CLOCK"))
   {
     static const uint32_t clock_cands[] = { 16000000, 12000000, 10000000, 8000000, 6000000 };
     uint32_t sel = dap_probe_clock(clock_cands, (int)ARRAY_SIZE(clock_cands), SRAM_ADDR + 0x100);
     verbose("auto-clock: %u kHz\n", sel / 1000);
   }
-
-  // Stop the core (reset-catch: halt out of SYSRESETREQ before any user code runs)
-  dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);
-  dap_write_word(DEMCR, DEMCR_VC_CORERESET);
-  dap_write_word(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ);
-
-  dap_reset_pin(1);
-  sleep_ms(10);
-
-  // Keep the debug interface alive across low-power states
-  dap_write_word(DBGMCU_CR, DBGMCU_CR_DBG_LP);
-
-  idcode = dap_read_word(DBGMCU_IDCODE);
 
   for (int i = 0; i < ARRAY_SIZE(devices); i++)
   {
