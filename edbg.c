@@ -30,6 +30,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <setjmp.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -184,13 +185,33 @@ void check(bool cond, char *fmt, ...)
 }
 
 //-----------------------------------------------------------------------------
+// Top-level flash retry. When armed (during the program/verify phase), a
+// failure that would normally be fatal instead unwinds to main, which
+// reconnects and re-runs the differential flash -- the robust way to ride out a
+// multi-second line-noise burst on a marginal cable that outlasts the
+// in-transfer retries (a fresh connect after the burst is far more reliable
+// than mid-stream re-sync).
+jmp_buf g_flash_retry_jmp;
+int g_flash_retries_left = 0;
+
+//-----------------------------------------------------------------------------
 void error_exit(char *fmt, ...)
 {
   va_list args;
 
+  va_start(args, fmt);
+
+  if (g_flash_retries_left > 0)
+  {
+    fprintf(stderr, "\nWarning (will reconnect and retry): ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+    longjmp(g_flash_retry_jmp, 1);
+  }
+
   disconnect_debugger();
 
-  va_start(args, fmt);
   fprintf(stderr, "Error: ");
   vfprintf(stderr, fmt, args);
   fprintf(stderr, "\n");
@@ -629,18 +650,50 @@ int main(int argc, char **argv)
     verbose(" done.\n");
   }
 
-  if (g_target_options.program)
+  if (g_target_options.program || g_target_options.verify)
   {
-    verbose("Programming...");
-    target_ops->program();
-    verbose(" done.\n");
-  }
+    char *fr = getenv("EDBG_FLASH_RETRIES");
+    volatile int flash_max = fr ? atoi(fr) : 8;
+    if (flash_max < 1)
+      flash_max = 1;
+    volatile int attempt = 0;
 
-  if (g_target_options.verify)
-  {
-    verbose("Verification...");
-    target_ops->verify();
-    verbose(" done.\n");
+    if (setjmp(g_flash_retry_jmp) != 0)
+    {
+      // A prior program/verify unwound here. Line-noise bursts on a marginal
+      // cable last from ms to seconds, so wait progressively longer for the
+      // burst to subside before reconnecting fresh and re-running. The
+      // differential flash reprograms only the pages still wrong, so each retry
+      // is cheap and convergent -- reruns make monotonic progress toward done.
+      attempt++;
+      g_flash_retries_left = (attempt + 1 < flash_max);
+      int wait_ms = 250 * attempt;
+      if (wait_ms > 3000)
+        wait_ms = 3000;
+      warning("flash interrupted (noise burst); waiting %dms, then reconnect + differential re-run [attempt %d/%d]\n",
+          wait_ms, attempt + 1, flash_max);
+      sleep_ms(wait_ms);
+      reconnect_debugger();
+      target_ops->select(&g_target_options);
+    }
+
+    g_flash_retries_left = (attempt + 1 < flash_max);
+
+    if (g_target_options.program)
+    {
+      verbose("Programming...");
+      target_ops->program();
+      verbose(" done.\n");
+    }
+
+    if (g_target_options.verify)
+    {
+      verbose("Verification...");
+      target_ops->verify();
+      verbose(" done.\n");
+    }
+
+    g_flash_retries_left = 0;
   }
 
   if (g_target_options.lock)

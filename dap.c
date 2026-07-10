@@ -295,9 +295,13 @@ void dap_disconnect(void)
 }
 
 //-----------------------------------------------------------------------------
+uint32_t dap_last_clock = 0;   // tracked so wedge recovery can drop clock + restore
+
 void dap_swj_clock(uint32_t clock)
 {
   uint8_t buf[5];
+
+  dap_last_clock = clock;
 
   buf[0] = ID_DAP_SWJ_CLOCK;
   buf[1] = clock & 0xff;
@@ -731,7 +735,9 @@ static bool buffer_request(dap_request_t *req)
 #define DAP_PIPELINE_DEPTH     8
 #define DAP_PIPELINE_MAX_OPS   1024   // ops per packet < report size (1 byte/op min)
 
-void dap_transfer(void)
+static int block_retries(void);
+
+static bool dap_transfer_once(void)
 {
   static uint8_t pkt_ops[DAP_PIPELINE_DEPTH][DAP_PIPELINE_MAX_OPS];
   static int pkt_ops_size[DAP_PIPELINE_DEPTH];
@@ -740,14 +746,15 @@ void dap_transfer(void)
   int inflight = 0, head = 0, tail = 0;
   int count, status;
   uint32_t *data;
+  bool failed = false;
 
   dap_response_count = 0;
   dap_csw = 0;
 
-  while (build_count < dap_request_count || inflight > 0)
+  while ((!failed && build_count < dap_request_count) || inflight > 0)
   {
-    // Fill the window
-    while (build_count < dap_request_count && inflight < bulk_window())
+    // Fill the window (stop submitting once a failure is seen; only drain)
+    while (!failed && build_count < dap_request_count && inflight < bulk_window())
     {
       int consumed = 0;
 
@@ -792,7 +799,15 @@ void dap_transfer(void)
     data   = (uint32_t *)&resp_buf[2];
 
     if (pkt_ops_size[head] != count || DAP_TRANSFER_OK != status)
-      error_exit("invalid response during transfer (count = %d/%d, status = %d): is the board turned on?", count, pkt_ops_size[head], status);
+    {
+      // Glitched/faulted transfer: mark failed and keep reaping the rest of the
+      // in-flight window so the USB response stream stays framed, then let
+      // dap_transfer() re-sync the link and retry the whole batch.
+      failed = true;
+      head = (head + 1) % DAP_PIPELINE_DEPTH;
+      inflight--;
+      continue;
+    }
 
     for (int i = 0; i < count; i++)
     {
@@ -813,7 +828,92 @@ void dap_transfer(void)
     inflight--;
   }
 
+  if (failed)
+    return false;   // dap_request_count left intact so the batch can be retried
+
   dap_request_count = 0;
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Latch-free wrapper. On a marginal/long cable a single glitched transfer
+// faults the DP and then every transfer returns ack=4/7 -- a wedge. A full link
+// re-sync clears it (line reset + dormant alert re-select the DP, ABORT clears
+// stickies, CTRL/STAT re-powers debug); an SWD line reset does not touch the
+// target core, so a running stub is undisturbed. dap_reset_link() reuses the
+// shared dap_request[] and itself issues transfers, so we snapshot/restore the
+// caller's batch each attempt and gate the re-sync's own transfers single-shot
+// through a recursion guard.
+static bool dap_in_recovery = false;
+
+// Robust wedge recovery for a marginal/long cable. A rare line-noise glitch
+// desyncs the DP; recovery must (1) wait out the noise burst -- bench-measured
+// bursty -- with a growing backoff, (2) re-sync the link (line reset + dormant
+// alert + DP powerup), and (3) force the next transfer to re-establish AP
+// CSW+TAR, since the re-sync reset the AP and stale host-side caching would
+// otherwise skip them.
+extern uint32_t dap_last_clock;
+
+static void dap_recover(int attempt)
+{
+  // Line noise on a marginal cable is bursty and time-varying (bench-measured:
+  // bursts from sub-ms to seconds). Exponential backoff rides out both -- short
+  // bursts clear in the first attempts, long ones in the later, higher-delay
+  // ones -- without wasting time when the burst is short.
+  int ms = (attempt < 8) ? (1 << attempt) : 256;
+  if (ms > 0) sleep_ms(ms);
+
+  // Re-sync at a low clock, then restore the flash clock. The wedge-recovery
+  // sequence (line reset + ADIv5.2 dormant alert + DP powerup) is host-driven
+  // and re-syncs far more reliably slow -- bench-proven on an AC-coupled cable
+  // where an 8 MHz re-sync fails to clear a wedge but a 2 MHz one succeeds
+  // (the same reason the standalone unwedge helper uses 2 MHz).
+  uint32_t flash_clock = dap_last_clock;
+
+  dap_request_count = 0;   // dap_reset_link builds its own batch from empty
+  dap_in_recovery = true;
+  dap_swj_clock(2000000);
+  dap_reset_link();
+  if (flash_clock && flash_clock != 2000000)
+    dap_swj_clock(flash_clock);
+  dap_in_recovery = false;
+
+  dap_set_address = true;
+  dap_csw = 0;
+}
+
+void dap_transfer(void)
+{
+  if (dap_in_recovery)
+  {
+    dap_transfer_once();
+    dap_request_count = 0;   // best-effort during recovery; discard result
+    return;
+  }
+
+  static dap_request_t saved[TRANSFER_SIZE];
+  int saved_count = dap_request_count;
+  memcpy(saved, dap_request, (size_t)saved_count * sizeof(dap_request_t));
+
+  int retries = block_retries();
+  for (int attempt = 0; attempt < retries; attempt++)
+  {
+    memcpy(dap_request, saved, (size_t)saved_count * sizeof(dap_request_t));
+    dap_request_count = saved_count;
+
+    if (dap_transfer_once())
+    {
+      if (attempt > 0)
+        verbose("~");
+      return;
+    }
+
+    if (attempt + 1 < retries)
+      dap_recover(attempt);
+  }
+
+  error_exit("transfer failed after %d attempts with link re-sync: "
+      "cable may be unusable at this clock", retries);
 }
 
 //-----------------------------------------------------------------------------
@@ -1022,9 +1122,19 @@ static bool dap_block_attempt(uint32_t addr, uint8_t *data, int size, bool write
   return !bulk_failed;
 }
 
+static int block_retries(void)
+{
+  char *env = getenv("EDBG_BLOCK_RETRIES");
+  int n = env ? atoi(env) : 8;   // short bursts recover here; long ones fall to
+                                 // the top-level reconnect+differential rerun
+  return (n < 1) ? 1 : (n > 100 ? 100 : n);
+}
+
 static void dap_block_xfer(uint32_t addr, uint8_t *data, int size, bool write)
 {
-  for (int attempt = 0; attempt < 3; attempt++)
+  int retries = block_retries();
+
+  for (int attempt = 0; attempt < retries; attempt++)
   {
     if (dap_block_attempt(addr, data, size, write))
     {
@@ -1033,11 +1143,22 @@ static void dap_block_xfer(uint32_t addr, uint8_t *data, int size, bool write)
       return;
     }
 
-    // Response stream may be desynced: whatever was owed has been reaped
-    // tolerantly by the attempt's drain; just start the transfer over.
+    // A single corrupted SWD packet (e.g. an in-band glitch on a marginal/long
+    // cable) desyncs the DP's protocol state machine, after which EVERY transfer
+    // returns ack=7 -- a latch. Draining and re-submitting can't clear it. A
+    // full link re-sync does: line reset + ADIv5.2 dormant alert re-select the
+    // DP, then ABORT clears the stickies and CTRL/STAT re-powers debug. An SWD
+    // line reset only touches the wire protocol, NOT the target core, so a stub
+    // burst-programming flash keeps running across the recovery; the next
+    // dap_block_attempt re-writes CSW+TAR, fully restoring the AP context. This
+    // is what makes flashing over a marginal cable latch-free: rare glitches
+    // become transparently-recovered retries instead of a fatal wedge.
+    if (attempt + 1 < retries)
+      dap_recover(attempt);
   }
 
-  error_exit("block transfer failed after 3 attempts: is the board turned on?");
+  error_exit("block transfer failed after %d attempts with link re-sync: "
+      "cable may be unusable at this clock", retries);
 }
 
 void dap_block_write(uint32_t addr, uint8_t *data, int size)

@@ -1044,31 +1044,55 @@ static void target_verify(void)
   uint32_t len = round_up(target_options.file_size, 4);
   uint32_t crc_dev, crc_exp;
 
-  if (NULL == getenv("EDBG_U5_NO_STUB"))
+  if (NULL != getenv("EDBG_U5_NO_STUB"))
   {
-    if (crc_stub_run(addr, len, &crc_dev))
+    verify_readback();
+    return;
+  }
+
+  // file_data is padded to options->size with 0xff (matching erased flash), so
+  // the expected CRC over the 4-byte-rounded length is well defined.
+  crc_exp = crc32_stm32(0xffffffff, target_options.file_data, len);
+
+  char *env = getenv("EDBG_U5_VERIFY_RETRIES");
+  int retries = env ? atoi(env) : 4;
+  if (retries < 1)
+    retries = 1;
+
+  for (int attempt = 0; attempt < retries; attempt++)
+  {
+    if (!crc_stub_run(addr, len, &crc_dev))
     {
-      // file_data is padded to options->size with 0xff (matching erased flash),
-      // so the expected CRC over the 4-byte-rounded length is well defined.
-      crc_exp = crc32_stm32(0xffffffff, target_options.file_data, len);
-
-      if (crc_dev == crc_exp)
-      {
-        verbose("CRC32 0x%08x ok\n", crc_dev);
-        return;
-      }
-
-      warning("CRC mismatch (target 0x%08x, expected 0x%08x); running readback for diagnostics\n",
-          crc_dev, crc_exp);
-      verify_readback();   // error_exits with the failing address on a real mismatch
-      warning("CRC stub mismatched but full readback verified OK -- please report this\n");
+      warning("CRC verify stub did not run; falling back to readback verify\n");
+      verify_readback();
       return;
     }
 
-    warning("CRC verify stub did not run; falling back to readback verify\n");
-  }
+    if (crc_dev == crc_exp)
+    {
+      verbose("CRC32 0x%08x ok\n", crc_dev);
+      return;
+    }
 
-  verify_readback();
+    if (attempt + 1 < retries)
+    {
+      // A silent in-band data glitch (ack=OK but wrong bits -- undetectable at
+      // the transfer layer) corrupted a page; with compression one bad byte
+      // corrupts a whole decoded page. The differential re-flash re-scans page
+      // CRCs and reprograms ONLY the corrupted pages -- cheap and convergent --
+      // then we re-verify. This is what makes a full flash over a marginal
+      // cable reliable end to end (paired with latch-free transfer recovery).
+      warning("verify CRC mismatch (target 0x%08x != 0x%08x); re-flashing changed pages [retry %d/%d]\n",
+          crc_dev, crc_exp, attempt + 1, retries - 1);
+      target_program();
+      continue;
+    }
+
+    // Exhausted retries: readback for a byte-accurate diagnostic (error_exits).
+    warning("CRC still mismatched after %d re-flash attempts; readback diagnostics\n", retries);
+    verify_readback();
+    return;
+  }
 }
 
 //-----------------------------------------------------------------------------
