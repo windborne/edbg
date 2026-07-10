@@ -165,6 +165,35 @@ the profiler and DWT buckets were wrong zero times.
   regardless. So: on a noisy line, drop the clock and add those two knobs
   before assuming a hardware fault. The real fix is quieter cabling.
 
+## Long / AC-coupled (USB-C) cable — the bandpass trap
+
+A different failure than the noisy line above, and one where the intuitive fix
+is *backwards*. SWD carried over a long USB-C cable often rides the SuperSpeed
+pairs, which have **AC-coupling capacitors** by spec. That makes the link a
+**bandpass channel**, not the low-pass a long wire is assumed to be:
+
+- **High-pass (the AC caps):** reads FAIL at low clock and are perfect high —
+  bench: 0/6 connect at ≤1 MHz, 6/6 at ≥4 MHz. **Lowering the clock makes it
+  worse**, the opposite of every other cable.
+- **Low-pass (cable RC):** fast-toggling data corrupts at 16 MHz (0xAA/random
+  100% wrong) while long runs stay clean.
+- **Reflection notch:** a sharp dead band (bench: ~9 MHz) where every transfer
+  fails, clean again just above and below.
+
+Usable passband ≈ 3–8 MHz; **8 MHz measured the lowest glitch rate** — use it
+(`-c 8000`). Diagnose with the read clock-response: if reads fail *low* and
+pass *high*, it's AC-coupled — do NOT drop the clock.
+
+Rare in-band line-noise glitches still desync the DP into an `ack=7` latch, and
+critically a normal recovery is weakened here (a line reset is a sustained-high
+level the AC caps attenuate). The driver handles this itself now (no external
+unwedge needed): latch-free transfer retry that **re-syncs at 2 MHz** (the
+host-driven reset sequence survives slow) then restores the flash clock, plus a
+self-healing verify (differential re-flash of corrupted pages) and a top-level
+reconnect+re-run to outlast multi-second bursts. Tunables: `EDBG_BLOCK_RETRIES`,
+`EDBG_FLASH_RETRIES`. What's left after all that is sustained EMI bursts — a
+hardware limit of the cable, not the tool.
+
 ## DP wedge recovery
 
 Symptoms: every command fails `status 7`, survives board power-cycle (supercap
