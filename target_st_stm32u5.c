@@ -229,8 +229,6 @@ static void flash_wait_done(void)
     error_exit("flash operation failed. FLASH_NSSR = 0x%08x", sr);
 }
 
-extern bool g_clock_explicit;   // true if the user passed -c (edbg.c)
-
 //-----------------------------------------------------------------------------
 static void target_select(target_options_t *options)
 {
@@ -248,14 +246,9 @@ static void target_select(target_options_t *options)
   // already-running app is safe for flashing.
   bool gentle_halt = (NULL != getenv("EDBG_U5_GENTLE_HALT"));
 
-  // Default to 8 MHz unless the user set -c explicitly. edbg's global default is
-  // 16 MHz, which is in this cable's stop-band: over a long/AC-coupled USB-C link
-  // reads pass but bulk writes corrupt ~100% (measured 0/8 full flashes at 16 MHz
-  // vs 10/10 at 8 MHz). 8 MHz is in the passband and is safe on a short cable too
-  // -- a full ~0.5 MB flash+verify is ~1.6 s. Set before the reset-catch so the
-  // timing-critical connect also runs in-band.
-  if (!g_clock_explicit)
-    dap_swj_clock(8000000);
+  // The 8 MHz passband default (vs 16 MHz, which corrupts bulk writes on a long
+  // AC-coupled cable) is applied globally in main() via ops.default_clock, before
+  // the first connect -- so identify() and this select() both already run in-band.
 
   if (!gentle_halt)
     dap_reset_pin(0);
@@ -1209,4 +1202,9 @@ target_ops_t target_st_stm32u5_ops =
   .fwrite    = target_fuse_write,
   .enumerate = target_enumerate,
   .help      = target_help,
+  // 16 MHz (edbg's global default) is in a long/AC-coupled USB-C cable's stop-band:
+  // reads pass but bulk writes corrupt ~100% (0/8 full flashes at 16 MHz vs 10/10 at
+  // 8 MHz). 8 MHz is in the passband and safe on a short cable too. Applied for the
+  // whole session (identify + connect + program) unless the user passes -c.
+  .default_clock = 8000000,
 };

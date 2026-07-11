@@ -69,6 +69,7 @@ typedef struct
   void (*fwrite)(int section, uint8_t *data);
   char *(*enumerate)(int i);
   char *help;
+  uint32_t default_clock;   // preferred SWJ clock (Hz) when the user gives no -c; 0 = use the global default
 } target_ops_t;
 
 /*- Prototypes --------------------------------------------------------------*/

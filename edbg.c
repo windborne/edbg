@@ -586,6 +586,12 @@ int main(int argc, char **argv)
 
   target_ops = target_get_ops(g_target);
 
+  // A target may prefer a safe clock when the user gave no -c (e.g. stm32u5 needs
+  // 8 MHz on a long AC-coupled cable). Apply it before the first connect so every
+  // step -- identify, select, program -- runs at it.
+  if (!g_clock_explicit && target_ops->default_clock)
+    g_clock = target_ops->default_clock;
+
   if (g_serial)
   {
     char *end = NULL;
