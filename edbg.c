@@ -646,9 +646,11 @@ int main(int argc, char **argv)
     verbose(" done.\n");
   }
 
-  if (g_target_options.identify)
+  // When flashing, identify runs inside the retry region below so the same
+  // reconnect + clock step-down that protects the program phase also covers the
+  // Core ID read on a marginal cable. Standalone identify runs here.
+  if (g_target_options.identify && !(g_target_options.program || g_target_options.verify))
   {
-    //message("warning: this only works for samd21 and there is no check for that\n");
     verbose("Indentifying... \n");
     target_ops->identify();
     verbose("done.\n");
@@ -678,11 +680,30 @@ int main(int argc, char **argv)
       // is cheap and convergent -- reruns make monotonic progress toward done.
       attempt++;
       g_flash_retries_left = (attempt + 1 < flash_max);
+
+      // Auto clock step-down for a worse-than-usual cable. The default 8 MHz
+      // clears most long cables first-try, so ride it for the first retry or two
+      // (a transient noise burst recovers at the same speed via the wait +
+      // differential rerun). Only if it KEEPS failing -- a genuinely worse/noisier
+      // cable, not a burst -- drop the clock every other retry to widen the margin.
+      // Floor 3 MHz: below ~3 MHz an AC-coupled USB-C cable's high-pass attenuates
+      // the line so reads start failing, i.e. lower would hurt, not help. The
+      // differential flash keeps the pages already written, so each lower-clock
+      // rerun only reprograms what's still wrong -- convergent, not a full redo.
+      if (attempt >= 2 && (attempt % 2) == 0)
+      {
+        long stepped = (long)g_clock * 3 / 4;
+        if (stepped < 3000000)
+          stepped = 3000000;
+        if (stepped < g_clock)
+          g_clock = stepped;
+      }
+
       int wait_ms = 250 * attempt;
       if (wait_ms > 3000)
         wait_ms = 3000;
-      warning("flash interrupted (noise burst); waiting %dms, then reconnect + differential re-run [attempt %d/%d]\n",
-          wait_ms, attempt + 1, flash_max);
+      warning("flash interrupted; waiting %dms, then reconnect at %ld kHz + differential re-run [attempt %d/%d]\n",
+          wait_ms, g_clock / 1000, attempt + 1, flash_max);
       sleep_ms(wait_ms);
       reconnect_debugger();
     }
@@ -691,6 +712,13 @@ int main(int argc, char **argv)
 
     // Inside the retry region: a select failure now reconnects and re-runs too.
     target_ops->select(&g_target_options);
+
+    if (g_target_options.identify)
+    {
+      verbose("Indentifying... \n");
+      target_ops->identify();
+      verbose("done.\n");
+    }
 
     if (g_target_options.program)
     {
