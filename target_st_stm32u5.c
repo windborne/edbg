@@ -251,7 +251,20 @@ static void target_select(target_options_t *options)
   // the first connect -- so identify() and this select() both already run in-band.
 
   if (!gentle_halt)
+  {
     dap_reset_pin(0);
+
+    // Reset-catch only works if nRESET is actually wired through this rig/mux
+    // to the target. If we assert it and it still reads back high, the "catch"
+    // silently degrades into poking a RUNNING app -- which fails in app-specific
+    // ways (WFI sleep gates AP access, remapped SWD pins, etc.) that look
+    // exactly like a bad cable. Warn so the operator knows which world they
+    // are debugging.
+    if (dap_read_pins() & DAP_PIN_nRESET)
+      warning("nRESET still reads HIGH while asserted -- reset line likely not "
+          "wired on this port; connecting to the running app instead of "
+          "reset-catch (try EDBG_U5_GENTLE_HALT=1, or fix the reset wiring)\n");
+  }
 
   // One link reset re-syncs the DP. Its ABORT clears CTRL/STAT.WDATAERR, so a
   // write-parity glitch latched by the marginal cable no longer wedges the link

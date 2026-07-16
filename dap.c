@@ -234,6 +234,8 @@ static uint32_t dap_response[TRANSFER_SIZE];
 static int dap_response_count = 0;
 static int dap_response_size = 0;
 
+static bool dap_in_recovery = false;   // best-effort mode: dap_transfer discards results
+
 static uint8_t dap_buf[TRANSFER_BUF_SIZE];
 static int dap_buf_size = 0;
 
@@ -476,6 +478,33 @@ void dap_reset_link(void)
   dap_add_req(TRANSFER_TYPE_WRITE_REG, TRANSFER_SIZE_WORD, SWD_DP_W_CTRL_STAT,
       DP_CST_CDBGPWRUPREQ | DP_CST_CSYSPWRUPREQ | DP_CST_MASKLANE(0xf));
   dap_transfer();
+
+  // ADIv5 requires waiting for the power-up handshake (CDBGPWRUPACK +
+  // CSYSPWRUPACK) before any AP access; we never did, and the very next thing
+  // the U5 driver does is an AP write batch (DHCSR halt). On a fast host the
+  // AP access can hit the wire microseconds after the powerup request; an AP
+  // access to an unpowered debug domain is UNPREDICTABLE per spec -- on a
+  // marginal wire it reads back as a garbage ACK, which permanently wedges the
+  // fleet's 2021 probe firmware (SWDIO left un-driven). Poll here so the AP
+  // traffic only ever starts against a powered domain. Skipped in recovery
+  // mode (responses are discarded there; the retried op re-faults harmlessly
+  // if powerup is still pending).
+  if (!dap_in_recovery)
+  {
+    for (int i = 0; i < 100; i++)
+    {
+      dap_add_req(TRANSFER_TYPE_READ_REG, TRANSFER_SIZE_WORD, SWD_DP_R_CTRL_STAT, 0);
+      dap_transfer();
+
+      uint32_t cst = dap_get_response(0);
+      if ((cst & (DP_CST_CDBGPWRUPACK | DP_CST_CSYSPWRUPACK)) ==
+          (DP_CST_CDBGPWRUPACK | DP_CST_CSYSPWRUPACK))
+        return;
+
+      sleep_ms(1);
+    }
+    warning("debug power-up not acknowledged (CTRL/STAT acks missing); continuing anyway\n");
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -533,6 +562,28 @@ void dap_reset_pin(int state)
   buf[5] = 0;
   buf[6] = 0;
   dbg_dap_cmd(buf, sizeof(buf), 7);
+}
+
+//-----------------------------------------------------------------------------
+// Read the current SWJ pin states (select mask 0 = read-only). Lets a target
+// driver verify that an asserted nRESET actually reads back low -- on a rig
+// where the reset line simply is not wired through to the target, reset-catch
+// silently degrades into "poke a running app", which matters when the app
+// sleeps (WFI) or repurposes the SWD pins.
+uint8_t dap_read_pins(void)
+{
+  uint8_t buf[7];
+
+  buf[0] = ID_DAP_SWJ_PINS;
+  buf[1] = 0; // Value (unused, nothing selected)
+  buf[2] = 0; // Select: none -- pure read
+  buf[3] = 0; // Wait
+  buf[4] = 0;
+  buf[5] = 0;
+  buf[6] = 0;
+  dbg_dap_cmd(buf, sizeof(buf), 7);
+
+  return buf[0];
 }
 
 //-----------------------------------------------------------------------------
@@ -859,8 +910,6 @@ static bool dap_transfer_once(void)
 // shared dap_request[] and itself issues transfers, so we snapshot/restore the
 // caller's batch each attempt and gate the re-sync's own transfers single-shot
 // through a recursion guard.
-static bool dap_in_recovery = false;
-
 // Robust wedge recovery for a marginal/long cable. A rare line-noise glitch
 // desyncs the DP; recovery must (1) wait out the noise burst -- bench-measured
 // bursty -- with a growing backoff, (2) re-sync the link (line reset + dormant
@@ -887,6 +936,17 @@ static void dap_recover(int attempt)
 
   dap_request_count = 0;   // dap_reset_link builds its own batch from empty
   dap_in_recovery = true;
+
+  // Re-issue DAP_Connect before the line reset. On the fleet's 2021 fp2-dap
+  // firmware a garbage ACK (routine on a long/marginal wire) leaves SWDIO as
+  // INPUT -- its protocol-error branch never restores pin drive, and its
+  // SWJ_Sequence only sets the output latch. So a line reset alone is clocked
+  // into a floating wire and can never recover; ID_DAP_CONNECT is the one
+  // command that re-runs DAP_CONFIG_CONNECT_SWD and restores drive. Harmless
+  // on fixed (2026-07+) firmware; host<->probe only, cannot itself glitch.
+  if (DAP_INTERFACE_SWD == dap_interface)
+    dap_connect(DAP_INTERFACE_SWD);
+
   dap_swj_clock(4000000);   // passband recovery clock (2 MHz is at/below the AC-coupling corner on a long USB-C cable)
   dap_reset_link();
   if (flash_clock && flash_clock != 4000000)

@@ -82,6 +82,8 @@ void dap_reset_link(void);
 void dap_reset_target(void);
 void dap_reset_target_hw(int state);
 void dap_reset_pin(int state);
+uint8_t dap_read_pins(void);          // SWJ pin states; bit 7 = nRESET (CMSIS-DAP layout)
+#define DAP_PIN_nRESET  (1 << 7)
 
 uint32_t dap_read_reg(uint8_t reg);
 void dap_write_reg(uint8_t reg, uint32_t data);

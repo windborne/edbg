@@ -692,9 +692,18 @@ int main(int argc, char **argv)
       // rerun only reprograms what's still wrong -- convergent, not a full redo.
       if (attempt >= 2 && (attempt % 2) == 0)
       {
+        // Floor default 3 MHz: on an AC-coupled USB-C cable the high-pass kills
+        // READS below ~3 MHz, so lower hurts there. But a plain resistive long
+        // wire keeps improving all the way down (bench: a cable whose reads were
+        // clean at 500 kHz) -- EDBG_MIN_CLOCK (kHz) lets those rigs step lower.
+        char *mc = getenv("EDBG_MIN_CLOCK");
+        long floor_hz = mc ? atol(mc) * 1000 : 3000000;
+        if (floor_hz < 100000)
+          floor_hz = 100000;
+
         long stepped = (long)g_clock * 3 / 4;
-        if (stepped < 3000000)
-          stepped = 3000000;
+        if (stepped < floor_hz)
+          stepped = floor_hz;
         if (stepped < g_clock)
           g_clock = stepped;
       }
