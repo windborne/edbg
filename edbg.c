@@ -666,7 +666,10 @@ int main(int argc, char **argv)
   if (g_target_options.program || g_target_options.verify)
   {
     char *fr = getenv("EDBG_FLASH_RETRIES");
-    volatile int flash_max = fr ? atoi(fr) : 8;
+    // Default 10 gives enough retries for the *0.75/retry step-down to walk the
+    // 8 MHz start clock all the way to the 1 MHz floor (8 -> 6 -> 4.5 -> 3.4 ->
+    // 2.5 -> 1.9 -> 1.4 -> 1.1 -> 1.0). EDBG_FLASH_RETRIES overrides.
+    volatile int flash_max = fr ? atoi(fr) : 10;
     if (flash_max < 1)
       flash_max = 1;
     volatile int attempt = 0;
@@ -682,22 +685,24 @@ int main(int argc, char **argv)
       g_flash_retries_left = (attempt + 1 < flash_max);
 
       // Auto clock step-down for a worse-than-usual cable. The default 8 MHz
-      // clears most long cables first-try, so ride it for the first retry or two
-      // (a transient noise burst recovers at the same speed via the wait +
-      // differential rerun). Only if it KEEPS failing -- a genuinely worse/noisier
-      // cable, not a burst -- drop the clock every other retry to widen the margin.
-      // Floor 3 MHz: below ~3 MHz an AC-coupled USB-C cable's high-pass attenuates
-      // the line so reads start failing, i.e. lower would hurt, not help. The
-      // differential flash keeps the pages already written, so each lower-clock
+      // clears most long cables first-try; the first retry re-tries the start
+      // clock (a transient noise burst recovers at the same speed via the wait +
+      // differential rerun). If it KEEPS failing -- a genuinely worse/noisier
+      // cable, not a burst -- drop the clock *0.75 every retry thereafter, down
+      // to a 1 MHz floor, reached within the default retry budget
+      // (8 -> 6 -> 4.5 -> 3.4 -> 2.5 -> 1.9 -> 1.4 -> 1.1 -> 1.0 MHz). Stepping only
+      // continues after a FAILED attempt, so a good cable succeeds high and
+      // never drops; the higher clocks are always tried first, so going low can
+      // only help. 1 MHz clears every long cable measured to date (resistive
+      // wires read cleanly well below it -- a pure AC-coupled cable would just
+      // fail the sub-3 MHz tries harmlessly after the good clocks were tried).
+      // The differential flash keeps pages already written, so each lower-clock
       // rerun only reprograms what's still wrong -- convergent, not a full redo.
-      if (attempt >= 2 && (attempt % 2) == 0)
+      // EDBG_MIN_CLOCK (kHz) overrides the floor.
+      if (attempt >= 2)
       {
-        // Floor default 3 MHz: on an AC-coupled USB-C cable the high-pass kills
-        // READS below ~3 MHz, so lower hurts there. But a plain resistive long
-        // wire keeps improving all the way down (bench: a cable whose reads were
-        // clean at 500 kHz) -- EDBG_MIN_CLOCK (kHz) lets those rigs step lower.
         char *mc = getenv("EDBG_MIN_CLOCK");
-        long floor_hz = mc ? atol(mc) * 1000 : 3000000;
+        long floor_hz = mc ? atol(mc) * 1000 : 1000000;
         if (floor_hz < 100000)
           floor_hz = 100000;
 
