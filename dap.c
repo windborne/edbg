@@ -58,6 +58,7 @@ enum
   ID_DAP_JTAG_SEQUENCE      = 0x14,
   ID_DAP_JTAG_CONFIGURE     = 0x15,
   ID_DAP_JTAG_IDCODE        = 0x16,
+  ID_DAP_VENDOR0            = 0x80,
 };
 
 enum
@@ -283,6 +284,20 @@ void dap_connect(int interf)
   check(buf[0] == cap, "DAP_CONNECT failed");
 
   dap_interface = interf;
+}
+
+//-----------------------------------------------------------------------------
+// Windborne frog DFU trigger (DAP_Vendor0 = 0x80): the frog clears GPNVM1 and
+// resets straight into the SAM-BA ROM bootloader, so bossac can reflash it over
+// its own USB -- no SWD jig, no helper frog. The frog resets the instant it sees
+// the command and sends no response, so this is fire-and-forget (submit, not the
+// send-then-read dbg_dap_cmd, which would block forever waiting for a reply).
+void dap_dfu(void)
+{
+  uint8_t buf[1];
+
+  buf[0] = ID_DAP_VENDOR0;
+  dbg_dap_cmd_submit(buf, sizeof(buf));
 }
 
 //-----------------------------------------------------------------------------

@@ -51,6 +51,10 @@
 /*- Definitions -------------------------------------------------------------*/
 #define MAX_DEBUGGERS     20
 
+// Long-only options start past the ASCII range so they never collide with a
+// short flag letter in the getopt switch.
+#define OPT_DFU           0x100
+
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
@@ -75,6 +79,7 @@ static const struct option long_options[] =
   { "size",      required_argument,  0, 'z' },
   { "fuse",      required_argument,  0, 'F' },
   { "identify",  no_argument,  0, 'i' },
+  { "dfu",       no_argument,  0, OPT_DFU },
   { 0, 0, 0, 0 }
 };
 
@@ -83,6 +88,7 @@ static const char *short_options = "hbepvkurf:t:ls:c:o:z:F:i";
 /*- Variables ---------------------------------------------------------------*/
 static char *g_serial = NULL;
 static bool g_list = false;
+static bool g_dfu = false;
 static char *g_target = NULL;
 static bool g_verbose = false;
 static long g_clock = 16000000;
@@ -466,6 +472,8 @@ static void print_help(char *name)
       "  -z, --size <size>          size for the operation\n"
       "  -F, --fuse <options>       operations on the fuses (use '-F help' for details)\n"
       "  -i, --identify             print core id of target\n"
+      "      --dfu                  send the Windborne frog DFU trigger, then exit: the frog\n"
+      "                             resets into the SAM-BA bootloader for a bossac reflash\n"
     );
   }
 
@@ -533,6 +541,7 @@ static void parse_command_line(int argc, char **argv)
       case 'z': g_target_options.size = (uint32_t)strtoul(optarg, NULL, 0); break;
       case 'F': g_target_options.fuse_cmd = optarg; break;
       case 'i': g_target_options.identify = true; break;
+      case OPT_DFU: g_dfu = true; break;
       default: exit(1); break;
     }
   }
@@ -547,50 +556,11 @@ static void parse_command_line(int argc, char **argv)
 }
 
 //-----------------------------------------------------------------------------
-int main(int argc, char **argv)
+// Resolve which attached debugger to use, honoring -s (serial or list index) and
+// falling back to the sole debugger when only one is present. Exits on ambiguity.
+static int select_debugger(debugger_t *debuggers, int n_debuggers)
 {
-  debugger_t debuggers[MAX_DEBUGGERS];
-  int n_debuggers = 0;
   int debugger = -1;
-  target_ops_t *target_ops;
-
-  parse_command_line(argc, argv);
-
-  if (!(g_target_options.erase || g_target_options.program || g_target_options.verify ||
-      g_target_options.lock || g_target_options.read || g_target_options.fuse_cmd ||
-      g_list || g_target))
-    error_exit("no actions specified");
-
-  if (g_target_options.read && (g_target_options.erase || g_target_options.program ||
-      g_target_options.verify || g_target_options.lock))
-    error_exit("mutually exclusive actions specified");
-
-  n_debuggers = dbg_enumerate(debuggers, MAX_DEBUGGERS);
-
-  if (g_list)
-  {
-    message("Attached debuggers:\n");
-    for (int i = 0; i < n_debuggers; i++)
-      message("  %d: %s - %s %s\n", i, debuggers[i].serial, debuggers[i].manufacturer, debuggers[i].product);
-    return 0;
-  }
-
-  if (NULL == g_target)
-    error_exit("no target type specified (use '-t' option)");
-
-  if (0 == strcmp(g_target, "list"))
-  {
-    target_list();
-    return 0;
-  }
-
-  target_ops = target_get_ops(g_target);
-
-  // A target may prefer a safe clock when the user gave no -c (e.g. stm32u5 needs
-  // 8 MHz on a long AC-coupled cable). Apply it before the first connect so every
-  // step -- identify, select, program -- runs at it.
-  if (!g_clock_explicit && target_ops->default_clock)
-    g_clock = target_ops->default_clock;
 
   if (g_serial)
   {
@@ -624,6 +594,70 @@ int main(int argc, char **argv)
   else if (n_debuggers > 1 && -1 == debugger)
     error_exit("more than one debugger found, please specify a serial number");
 
+  return debugger;
+}
+
+//-----------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
+  debugger_t debuggers[MAX_DEBUGGERS];
+  int n_debuggers = 0;
+  int debugger = -1;
+  target_ops_t *target_ops;
+
+  parse_command_line(argc, argv);
+
+  if (!(g_target_options.erase || g_target_options.program || g_target_options.verify ||
+      g_target_options.lock || g_target_options.read || g_target_options.fuse_cmd ||
+      g_list || g_dfu || g_target))
+    error_exit("no actions specified");
+
+  if (g_target_options.read && (g_target_options.erase || g_target_options.program ||
+      g_target_options.verify || g_target_options.lock))
+    error_exit("mutually exclusive actions specified");
+
+  n_debuggers = dbg_enumerate(debuggers, MAX_DEBUGGERS);
+
+  if (g_list)
+  {
+    message("Attached debuggers:\n");
+    for (int i = 0; i < n_debuggers; i++)
+      message("  %d: %s - %s %s\n", i, debuggers[i].serial, debuggers[i].manufacturer, debuggers[i].product);
+    return 0;
+  }
+
+  // DFU trigger is a pure vendor HID command -- no target, clock, or SWD connect.
+  // Open the frog, fire it, and exit; the frog resets into SAM-BA immediately.
+  if (g_dfu)
+  {
+    debugger = select_debugger(debuggers, n_debuggers);
+    g_debugger = &debuggers[debugger];
+
+    dbg_open(g_debugger);
+    message("Sending DFU trigger to %s -- it will reset into the SAM-BA "
+            "bootloader for a bossac reflash.\n", g_debugger->serial);
+    dap_dfu();
+    return 0;
+  }
+
+  if (NULL == g_target)
+    error_exit("no target type specified (use '-t' option)");
+
+  if (0 == strcmp(g_target, "list"))
+  {
+    target_list();
+    return 0;
+  }
+
+  target_ops = target_get_ops(g_target);
+
+  // A target may prefer a safe clock when the user gave no -c (e.g. stm32u5 needs
+  // 8 MHz on a long AC-coupled cable). Apply it before the first connect so every
+  // step -- identify, select, program -- runs at it.
+  if (!g_clock_explicit && target_ops->default_clock)
+    g_clock = target_ops->default_clock;
+
+  debugger = select_debugger(debuggers, n_debuggers);
   g_debugger = &debuggers[debugger];
 
   dbg_open(g_debugger);
