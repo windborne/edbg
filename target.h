@@ -70,6 +70,8 @@ typedef struct
   char *(*enumerate)(int i);
   char *help;
   uint32_t default_clock;   // preferred SWJ clock (Hz) when the user gives no -c; 0 = use the global default
+  uint32_t ram_start;       // base of the main contiguous SRAM (for --rtt control-block auto-scan); 0 = unknown
+  uint32_t ram_size;        // size of that SRAM in bytes; 0 = unknown (scan needs explicit --rtt-scan/-len)
 } target_ops_t;
 
 /*- Prototypes --------------------------------------------------------------*/

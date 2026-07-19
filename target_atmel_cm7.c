@@ -373,5 +373,10 @@ target_ops_t target_atmel_cm7_ops =
   .fwrite    = target_fuse_write,
   .enumerate = target_enumerate,
   .help      = target_help,
+  // SAM E7x/S7x/V7x SRAM for the --rtt control-block auto-scan: mapped at 0x20400000,
+  // up to 384K on the largest part. The scan stops at the first ID hit, so an
+  // over-estimate only reads a few extra unmapped words at the tail.
+  .ram_start = 0x20400000,
+  .ram_size  = 384 * 1024,
 };
 

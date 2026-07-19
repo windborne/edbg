@@ -1220,4 +1220,12 @@ target_ops_t target_st_stm32u5_ops =
   // 8 MHz). 8 MHz is in the passband and safe on a short cable too. Applied for the
   // whole session (identify + connect + program) unless the user passes -c.
   .default_clock = 8000000,
+  // Contiguous SRAM at 0x20000000 for the --rtt control-block auto-scan. STM32U575/U585
+  // (0x482, our b4 part) = SRAM1(192K)+SRAM2(64K)+SRAM3(512K) = 768K contiguous from
+  // 0x20000000 (SRAM4 16K lives at 0x28000000, separate). U59x/U5Ax/U5Fx/U5Gx have MORE
+  // SRAM here; U53x/U54x have less -- for those, pass --rtt-scan/--rtt-scan-len. A
+  // static _SEGGER_RTT lands in .bss/.data which the linker places low in SRAM1, so
+  // 768K covers the realistic cases and the scan stops at the first hit anyway.
+  .ram_start = 0x20000000,
+  .ram_size  = 768 * 1024,
 };

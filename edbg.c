@@ -56,6 +56,8 @@
 #define OPT_DFU           0x100
 #define OPT_RTT           0x101
 #define OPT_RTT_ADDR      0x102
+#define OPT_RTT_SCAN      0x103
+#define OPT_RTT_SCAN_LEN  0x104
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -84,6 +86,8 @@ static const struct option long_options[] =
   { "dfu",       no_argument,  0, OPT_DFU },
   { "rtt",       no_argument,        0, OPT_RTT },
   { "rtt-addr",  required_argument,  0, OPT_RTT_ADDR },
+  { "rtt-scan",  required_argument,  0, OPT_RTT_SCAN },
+  { "rtt-scan-len", required_argument, 0, OPT_RTT_SCAN_LEN },
   { 0, 0, 0, 0 }
 };
 
@@ -95,6 +99,8 @@ static bool g_list = false;
 static bool g_dfu = false;
 static bool g_rtt = false;
 static uint32_t g_rtt_addr = 0;
+static uint32_t g_rtt_scan = 0;      // scan-range base (0 = use the target driver's ram_start)
+static uint32_t g_rtt_scan_len = 0;  // scan-range length in bytes (0 = use the driver's ram_size)
 static char *g_target = NULL;
 static bool g_verbose = false;
 static long g_clock = 16000000;
@@ -481,8 +487,12 @@ static void print_help(char *name)
       "      --dfu                  send the Windborne frog DFU trigger, then exit: the frog\n"
       "                             resets into the SAM-BA bootloader for a bossac reflash\n"
       "      --rtt                  bridge the target's SEGGER RTT ring buffers to stdio while\n"
-      "                             the core runs (no halt); needs -t and --rtt-addr\n"
-      "      --rtt-addr <addr>      address of the _SEGGER_RTT control block (from the ELF/.map)\n"
+      "                             the core runs (no halt); needs -t. With no --rtt-addr it\n"
+      "                             scans the target SRAM for the 'SEGGER RTT' control block\n"
+      "      --rtt-addr <addr>      address of the _SEGGER_RTT control block (from the ELF/.map);\n"
+      "                             the fast path -- skips the RAM scan\n"
+      "      --rtt-scan <addr>      base of the RAM range to scan (default: target driver's SRAM)\n"
+      "      --rtt-scan-len <n>     length of the RAM range to scan in bytes\n"
     );
   }
 
@@ -553,6 +563,8 @@ static void parse_command_line(int argc, char **argv)
       case OPT_DFU: g_dfu = true; break;
       case OPT_RTT: g_rtt = true; break;
       case OPT_RTT_ADDR: g_rtt_addr = (uint32_t)strtoul(optarg, NULL, 0); break;
+      case OPT_RTT_SCAN: g_rtt_scan = (uint32_t)strtoul(optarg, NULL, 0); break;
+      case OPT_RTT_SCAN_LEN: g_rtt_scan_len = (uint32_t)strtoul(optarg, NULL, 0); break;
       default: exit(1); break;
     }
   }
@@ -609,28 +621,173 @@ static int select_debugger(debugger_t *debuggers, int n_debuggers)
 }
 
 //-----------------------------------------------------------------------------
+// SEGGER control-block layout (matches boards/lib/rtt/rtt.c):
+//   0 char acID[16]  16 i32 MaxUp  20 i32 MaxDown  24 RING up[0]  48 RING down[0]
+//   RING(24): 0 sName*  4 pBuffer*  8 SizeOfBuffer  12 WrOff  16 RdOff  20 Flags
+enum { RTT_UP = 24, RTT_DOWN = 48, RTT_R_PBUF = 4, RTT_R_SIZE = 8, RTT_R_WR = 12, RTT_R_RD = 16 };
+
+// The 16-byte acID at the head of the control block. SEGGER stores the literal
+// "SEGGER RTT" then 6 NULs. (SEGGER's own runtime writes the 'S' last so a debugger
+// can't latch a half-initialized block during startup -- but our target ring uses a
+// STATICALLY initialized .acID = "SEGGER RTT" that the C runtime copies into .bss/.data
+// before main(), so by the time we scan the full string is always present. A plain
+// literal match is therefore correct; no reversed/partial handling is needed.)
+static const char RTT_ID[16] = "SEGGER RTT";
+
+//-----------------------------------------------------------------------------
+// Validate that `cb` looks like a real control block, not a stale/embedded copy of
+// the id string. Reads the header and checks MaxUp/MaxDown are sane and the up/down
+// ring buffers point inside [ram_start, ram_end) with WrOff/RdOff < SizeOfBuffer.
+// ram_start/ram_end bound the sanity check on pointers; pass 0/0 to skip the RAM-range
+// part (still checks MaxUp/Down and offsets). Returns true if it passes.
+static bool rtt_validate_cb(uint32_t cb, uint32_t ram_start, uint32_t ram_end)
+{
+  int32_t max_up   = (int32_t)dap_read_word(cb + 16);
+  int32_t max_down = (int32_t)dap_read_word(cb + 20);
+
+  // A statically-defined block has a small fixed channel count. probe-rs/OpenOCD reject
+  // > 255; be tighter -- a real ring here has a handful of channels, and a bogus hit
+  // (id bytes appearing in data) almost always yields wild counts.
+  if (max_up < 1 || max_up > 16 || max_down < 0 || max_down > 16)
+    return false;
+
+  // Up channel 0 must have a buffer inside RAM with a non-zero, in-range size and
+  // read/write offsets within it. (Down channel 0 may legitimately be absent if
+  // max_down is 0, so only check it when present.)
+  uint32_t up_buf  = dap_read_word(cb + RTT_UP + RTT_R_PBUF);
+  uint32_t up_size = dap_read_word(cb + RTT_UP + RTT_R_SIZE);
+  uint32_t up_wr   = dap_read_word(cb + RTT_UP + RTT_R_WR);
+  uint32_t up_rd   = dap_read_word(cb + RTT_UP + RTT_R_RD);
+
+  if (0 == up_size || up_size > 0x00100000u)   // 1 MB ceiling: no sane RTT ring is bigger
+    return false;
+  if (up_wr >= up_size || up_rd >= up_size)
+    return false;
+  if (ram_end > ram_start)
+  {
+    if (up_buf < ram_start || up_buf >= ram_end)
+      return false;
+    if ((uint64_t)up_buf + up_size > ram_end)
+      return false;
+  }
+
+  if (max_down > 0)
+  {
+    uint32_t dn_buf  = dap_read_word(cb + RTT_DOWN + RTT_R_PBUF);
+    uint32_t dn_size = dap_read_word(cb + RTT_DOWN + RTT_R_SIZE);
+    if (0 == dn_size || dn_size > 0x00100000u)
+      return false;
+    if (ram_end > ram_start && (dn_buf < ram_start || (uint64_t)dn_buf + dn_size > ram_end))
+      return false;
+  }
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Scan [start, start+len) of target RAM for the SEGGER RTT control block and return
+// its address. Reads the range in overlapping chunks (the 16-byte id can straddle a
+// chunk boundary) and byte-scans each for RTT_ID, validating every hit so id bytes
+// that happen to appear in ring data aren't mistaken for the block. error_exits if
+// nothing valid is found. The id is 4-byte aligned in practice (it's the first field
+// of an aligned struct) but we scan every byte to be safe against odd linker layouts.
+static uint32_t rtt_scan(uint32_t start, uint32_t len, uint32_t ram_start, uint32_t ram_end)
+{
+  enum { CHUNK = 8192, OVERLAP = 16 };   // OVERLAP >= sizeof(RTT_ID) so a straddling id is seen
+  static uint8_t buf[CHUNK];
+
+  // dap_block_read needs word-aligned addr+size; round the window inward/outward to words.
+  start &= ~3u;
+  len = (len + 3u) & ~3u;
+
+  fprintf(stderr, "RTT scan: 0x%08x .. 0x%08x (%u KB) for the control block ...\n",
+      (unsigned)start, (unsigned)(start + len), (unsigned)(len / 1024));
+
+  uint32_t addr = start;
+  uint32_t end = start + len;
+
+  while (addr < end)
+  {
+    uint32_t want = end - addr;
+    if (want > CHUNK)
+      want = CHUNK;
+    want &= ~3u;
+    if (0 == want)
+      break;
+
+    dap_block_read(addr, buf, (int)want);
+
+    // A candidate can start anywhere the full 16-byte id still fits in this chunk.
+    if (want >= sizeof(RTT_ID))
+    {
+      for (uint32_t i = 0; i + sizeof(RTT_ID) <= want; i++)
+      {
+        if (buf[i] != RTT_ID[0])
+          continue;
+        if (0 != memcmp(&buf[i], RTT_ID, sizeof(RTT_ID)))
+          continue;
+
+        uint32_t cb = addr + i;
+        if (rtt_validate_cb(cb, ram_start, ram_end))
+        {
+          fprintf(stderr, "RTT scan: found control block at 0x%08x\n", (unsigned)cb);
+          return cb;
+        }
+        // id matched but validation failed -- a stale/partial block; keep scanning.
+        fprintf(stderr, "RTT scan: id at 0x%08x failed validation, continuing\n",
+            (unsigned)cb);
+      }
+    }
+
+    // Step by chunk minus the overlap so an id spanning the boundary is caught next pass.
+    if (want < OVERLAP)
+      break;
+    addr += want - OVERLAP;
+  }
+
+  error_exit("RTT scan found no control block in 0x%08x..0x%08x; give --rtt-addr or "
+      "widen --rtt-scan/--rtt-scan-len", (unsigned)start, (unsigned)end);
+  return 0;   // unreachable
+}
+
+//-----------------------------------------------------------------------------
 // RTT-over-SWD bridge: pump a target's SEGGER-layout ring buffers <-> stdio while
 // the core keeps running (background MEM-AP access, no halt). Wrap this in a PTY
 // (socat/a tiny script) and tacoma -- or any RTT viewer -- uses the byte stream as
 // a serial port, unchanged. On any SWD fault the dap layer error_exits; a
 // supervisor respawns us, which reconnects: that's the re-attach-after-reset /
 // marginal-cable recovery, kept out here instead of complicating the loop.
-static void cmd_rtt(void)
+static void cmd_rtt(target_ops_t *ops)
 {
-  // SEGGER control-block layout (matches boards/lib/rtt/rtt.c):
-  //   0 char acID[16]  16 i32 MaxUp  20 i32 MaxDown  24 RING up[0]  48 RING down[0]
-  //   RING(24): 0 sName*  4 pBuffer*  8 SizeOfBuffer  12 WrOff  16 RdOff  20 Flags
-  enum { UP = 24, DOWN = 48, R_PBUF = 4, R_SIZE = 8, R_WR = 12, R_RD = 16 };
+  enum { UP = RTT_UP, DOWN = RTT_DOWN, R_PBUF = RTT_R_PBUF, R_SIZE = RTT_R_SIZE,
+         R_WR = RTT_R_WR, R_RD = RTT_R_RD };
+
+  // Scan range for auto-detect: explicit --rtt-scan[/-len] wins, else the target
+  // driver's SRAM base+size. The range also bounds the pointer-sanity check.
+  uint32_t scan_base = g_rtt_scan ? g_rtt_scan : ops->ram_start;
+  uint32_t scan_len  = g_rtt_scan_len ? g_rtt_scan_len : ops->ram_size;
+  uint32_t ram_start = ops->ram_start ? ops->ram_start : scan_base;
+  uint32_t ram_end   = ram_start ? ram_start + (ops->ram_size ? ops->ram_size : scan_len) : 0;
+
   uint32_t cb = g_rtt_addr;
 
   if (0 == cb)
-    error_exit("--rtt needs --rtt-addr <_SEGGER_RTT address> (from the target ELF/.map)");
-
-  // Validate the id so a wrong address fails loudly instead of streaming garbage.
-  uint8_t id[16];
-  dap_read_block(cb, id, sizeof(id));
-  if (0 != memcmp(id, "SEGGER RTT", 10))
-    error_exit("no RTT control block at 0x%08x (id mismatch)", (unsigned)cb);
+  {
+    // No explicit address: scan target RAM for the "SEGGER RTT" id.
+    if (0 == scan_base || 0 == scan_len)
+      error_exit("--rtt with no --rtt-addr needs a scan range: the '%s' target exposes "
+          "no SRAM map, so pass --rtt-scan <addr> --rtt-scan-len <bytes> (or --rtt-addr)",
+          g_target);
+    cb = rtt_scan(scan_base, scan_len, ram_start, ram_end);
+  }
+  else
+  {
+    // Validate the id so a wrong address fails loudly instead of streaming garbage.
+    uint8_t id[16];
+    dap_read_block(cb, id, sizeof(id));
+    if (0 != memcmp(id, "SEGGER RTT", 10))
+      error_exit("no RTT control block at 0x%08x (id mismatch)", (unsigned)cb);
+  }
 
   uint32_t up_buf  = dap_read_word(cb + UP + R_PBUF);
   uint32_t up_size = dap_read_word(cb + UP + R_SIZE);
@@ -773,7 +930,7 @@ int main(int argc, char **argv)
   // select()/halt the core; the target keeps running.
   if (g_rtt)
   {
-    cmd_rtt();
+    cmd_rtt(target_ops);
     return 0;
   }
 

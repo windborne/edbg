@@ -409,5 +409,10 @@ target_ops_t target_atmel_cm4v2_ops =
   .fwrite    = target_fuse_write,
   .enumerate = target_enumerate,
   .help      = target_help,
+  // SAM D5x/E5x SRAM for the --rtt control-block auto-scan: 0x20000000, up to 256K on
+  // the largest part (D51P20/E51). Smaller parts have less; the scan stops at the first
+  // ID hit, so an over-estimate only reads a few extra unmapped words at the tail.
+  .ram_start = 0x20000000,
+  .ram_size  = 256 * 1024,
 };
 
