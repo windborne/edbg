@@ -71,7 +71,7 @@ enum
 void dap_led(int index, int state);
 void dap_connect(int interf);
 void dap_disconnect(void);
-void dap_dfu(void);
+void dap_dfu(const char *serial);
 void dap_swj_clock(uint32_t clock);
 void dap_transfer_configure(uint8_t idle, uint16_t retry, uint16_t match_retry);
 void dap_swd_configure(int cfg);

@@ -636,7 +636,7 @@ int main(int argc, char **argv)
     dbg_open(g_debugger);
     message("Sending DFU trigger to %s -- it will reset into the SAM-BA "
             "bootloader for a bossac reflash.\n", g_debugger->serial);
-    dap_dfu();
+    dap_dfu(g_debugger->serial);
     return 0;
   }
 

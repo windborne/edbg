@@ -292,12 +292,21 @@ void dap_connect(int interf)
 // its own USB -- no SWD jig, no helper frog. The frog resets the instant it sees
 // the command and sends no response, so this is fire-and-forget (submit, not the
 // send-then-read dbg_dap_cmd, which would block forever waiting for a reply).
-void dap_dfu(void)
+//
+// The payload echoes the frog's own serial as an arm/fire guard: newer firmware
+// requires it (so a stray/fuzzed 1-byte 0x80 can't brick a probe, and a broadcast
+// 0x80 can't take out a whole bench), while older firmware ignores the payload --
+// so appending the serial is compatible with both.
+void dap_dfu(const char *serial)
 {
-  uint8_t buf[1];
+  uint8_t buf[64];
+  int n = 0;
 
-  buf[0] = ID_DAP_VENDOR0;
-  dbg_dap_cmd_submit(buf, sizeof(buf));
+  buf[n++] = ID_DAP_VENDOR0;
+  for (const char *s = serial; s && *s && n < (int)sizeof(buf); s++)
+    buf[n++] = (uint8_t)*s;
+
+  dbg_dap_cmd_submit(buf, n);
 }
 
 //-----------------------------------------------------------------------------
