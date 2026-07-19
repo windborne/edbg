@@ -1333,6 +1333,18 @@ void dap_write_word(uint32_t addr, uint32_t data)
 }
 
 //-----------------------------------------------------------------------------
+// Write the DP ABORT register directly (bypasses the MEM-AP). `bits` is any OR of
+// the DP_ABORT_* flags -- e.g. 0x1e (STKCMP|STKERR|WDERR|ORUNERR clear, no
+// DAPABORT) to wipe sticky error flags without dropping an in-flight AP
+// transaction. Mirrors the ABORT write in dap_reset_link(); exposed so a caller
+// (memdump) can clear stickies after a standalone read/halt/resume sequence.
+void dap_write_abort(uint32_t bits)
+{
+  dap_add_req(TRANSFER_TYPE_WRITE_REG, TRANSFER_SIZE_WORD, SWD_DP_W_ABORT, bits);
+  dap_transfer();
+}
+
+//-----------------------------------------------------------------------------
 void dap_read_block(uint32_t addr, uint8_t *data, int size)
 {
   uint32_t *buf = (uint32_t *)data;

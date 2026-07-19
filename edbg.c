@@ -58,6 +58,8 @@
 #define OPT_RTT_ADDR      0x102
 #define OPT_RTT_SCAN      0x103
 #define OPT_RTT_SCAN_LEN  0x104
+#define OPT_MEMDUMP       0x105
+#define OPT_FREEZE        0x106
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -88,6 +90,8 @@ static const struct option long_options[] =
   { "rtt-addr",  required_argument,  0, OPT_RTT_ADDR },
   { "rtt-scan",  required_argument,  0, OPT_RTT_SCAN },
   { "rtt-scan-len", required_argument, 0, OPT_RTT_SCAN_LEN },
+  { "memdump",   no_argument,        0, OPT_MEMDUMP },
+  { "freeze",    no_argument,        0, OPT_FREEZE },
   { 0, 0, 0, 0 }
 };
 
@@ -101,6 +105,8 @@ static bool g_rtt = false;
 static uint32_t g_rtt_addr = 0;
 static uint32_t g_rtt_scan = 0;      // scan-range base (0 = use the target driver's ram_start)
 static uint32_t g_rtt_scan_len = 0;  // scan-range length in bytes (0 = use the driver's ram_size)
+static bool g_memdump = false;       // --memdump: snapshot [offset, offset+size) of target memory
+static bool g_freeze = false;        // --freeze: halt the core across the dump, then resume ASAP
 static char *g_target = NULL;
 static bool g_verbose = false;
 static long g_clock = 16000000;
@@ -493,6 +499,17 @@ static void print_help(char *name)
       "                             the fast path -- skips the RAM scan\n"
       "      --rtt-scan <addr>      base of the RAM range to scan (default: target driver's SRAM)\n"
       "      --rtt-scan-len <n>     length of the RAM range to scan in bytes\n"
+      "      --memdump              snapshot target memory [<-o offset>, +<-z size>) over SWD\n"
+      "                             and write it raw to -f <file> (needs -t, -o, -z). Attaches\n"
+      "                             WITHOUT resetting the target. Without --freeze the read is\n"
+      "                             non-intrusive (core keeps running) but NOT a coherent\n"
+      "                             snapshot -- multi-word structs can tear; use --freeze.\n"
+      "      --freeze               (with --memdump) halt the core, dump, resume ASAP; prints\n"
+      "                             the freeze window (halt->resume, ms) to stderr. If the core\n"
+      "                             is already halted (e.g. a gdb session), it is dumped as-is\n"
+      "                             and NOT resumed. Do NOT --freeze large regions -- the target\n"
+      "                             watchdog is not fed while halted (ballpark: 1KB ~1-3ms,\n"
+      "                             16KB ~15-40ms, 256KB SRAM ~0.3-0.7s; USB-round-trip-bound).\n"
     );
   }
 
@@ -565,6 +582,8 @@ static void parse_command_line(int argc, char **argv)
       case OPT_RTT_ADDR: g_rtt_addr = (uint32_t)strtoul(optarg, NULL, 0); break;
       case OPT_RTT_SCAN: g_rtt_scan = (uint32_t)strtoul(optarg, NULL, 0); break;
       case OPT_RTT_SCAN_LEN: g_rtt_scan_len = (uint32_t)strtoul(optarg, NULL, 0); break;
+      case OPT_MEMDUMP: g_memdump = true; break;
+      case OPT_FREEZE: g_freeze = true; break;
       default: exit(1); break;
     }
   }
@@ -857,6 +876,108 @@ static void cmd_rtt(target_ops_t *ops)
 }
 
 //-----------------------------------------------------------------------------
+// ARMv7-M/ARMv8-M debug halting-control registers, used by --freeze. Same values
+// the stm32u5 driver writes for its gentle halt (DHCSR at 0xe000edf0):
+//   HALT   = DBGKEY | C_DEBUGEN | C_HALT  = 0xa05f0003
+//   RESUME = DBGKEY (clears C_DEBUGEN | C_HALT, no C_MASKINTS) = 0xa05f0000
+// S_HALT (bit 17 of DHCSR read) reports whether the core is currently halted.
+#define MD_DHCSR          0xe000edf0
+#define MD_DHCSR_HALT     0xa05f0003u
+#define MD_DHCSR_RESUME   0xa05f0000u
+#define MD_DHCSR_S_HALT   (1u << 17)
+#define MD_ABORT_CLR      0x1e   // STKCMP|STKERR|WDERR|ORUNERR clear (no DAPABORT)
+
+//-----------------------------------------------------------------------------
+// Wall-clock milliseconds, for measuring the freeze window.
+static double now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
+}
+
+//-----------------------------------------------------------------------------
+// memdump: snapshot [offset, offset+size) of target memory over SWD and write it
+// raw to -f <file>. The link is already connected (reconnect_debugger in main);
+// we deliberately never reset or select() the target -- a plain MEM-AP attach, so
+// the running app is undisturbed in live mode.
+//
+// --freeze halts the core across the block read and resumes it ASAP, giving a
+// coherent snapshot (no torn multi-word reads) at the cost of a short stall. The
+// S_HALT rule: if the core is ALREADY halted when we attach (a gdb session stopped
+// it), we dump as-is and never resume -- resuming a core someone else deliberately
+// stopped would be wrong. Live mode (no --freeze) skips all DHCSR writes: the
+// reads are non-intrusive while the core runs, but the result is NOT a coherent
+// snapshot (multi-word structs can tear mid-read), so we warn.
+//
+// dap_block_read wants a word-aligned addr+size; we widen [addr, addr+len) outward
+// to word boundaries for the transfer, then slice back to exactly `len` on output.
+static void cmd_memdump(void)
+{
+  check(NULL != g_target_options.name, "--memdump needs an output file (-f)");
+  check(g_target_options.offset >= 0, "--memdump needs a start address (-o/--offset)");
+  check(g_target_options.size > 0, "--memdump needs a size (-z/--size)");
+
+  uint32_t addr = (uint32_t)g_target_options.offset;
+  uint32_t len  = (uint32_t)g_target_options.size;
+
+  // Widen outward to word boundaries for the block read; slice back to `len`.
+  uint32_t a0 = addr & ~3u;
+  uint32_t a1 = (addr + len + 3u) & ~3u;
+  uint32_t span = a1 - a0;
+
+  uint8_t *buf = buf_alloc((int)span);
+
+  bool we_halted = false;
+
+  if (g_freeze)
+  {
+    uint32_t dhcsr_pre = dap_read_word(MD_DHCSR);
+
+    if (dhcsr_pre & MD_DHCSR_S_HALT)
+    {
+      // Someone else (a gdb session) stopped the core. Dump as-is, never resume.
+      fprintf(stderr, "core already halted -- dumped without resume\n");
+    }
+    else
+    {
+      dap_write_word(MD_DHCSR, MD_DHCSR_HALT);
+      we_halted = true;
+    }
+  }
+  else
+  {
+    fprintf(stderr, "WARNING: live dump (no --freeze) is NOT a coherent snapshot -- "
+        "multi-word structs can tear mid-read; use --freeze for consistency\n");
+  }
+
+  double t_halt = now_ms();
+
+  // The fast path: 1 KB TAR-boundary segmentation + retry + link re-sync.
+  dap_block_read(a0, buf, (int)span);
+
+  if (we_halted)
+  {
+    // Resume ASAP -- one word write, no C_MASKINTS.
+    dap_write_word(MD_DHCSR, MD_DHCSR_RESUME);
+    double window = now_ms() - t_halt;
+    fprintf(stderr, "freeze window (halt->resume): %.1f ms (%u bytes)\n",
+        window, (unsigned)len);
+  }
+
+  // Clear any sticky DP error left by the sequence (no DAPABORT: nothing in flight).
+  dap_write_abort(MD_ABORT_CLR);
+
+  // Slice the word-aligned span back to exactly [addr, addr+len).
+  save_file(g_target_options.name, buf + (addr - a0), (int)len);
+
+  fprintf(stderr, "memdump: wrote %u bytes from 0x%08x to %s\n",
+      (unsigned)len, (unsigned)addr, g_target_options.name);
+
+  buf_free(buf);
+}
+
+//-----------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
   debugger_t debuggers[MAX_DEBUGGERS];
@@ -868,7 +989,7 @@ int main(int argc, char **argv)
 
   if (!(g_target_options.erase || g_target_options.program || g_target_options.verify ||
       g_target_options.lock || g_target_options.read || g_target_options.fuse_cmd ||
-      g_list || g_dfu || g_rtt || g_target))
+      g_list || g_dfu || g_rtt || g_memdump || g_target))
     error_exit("no actions specified");
 
   if (g_target_options.read && (g_target_options.erase || g_target_options.program ||
@@ -931,6 +1052,19 @@ int main(int argc, char **argv)
   if (g_rtt)
   {
     cmd_rtt(target_ops);
+    return 0;
+  }
+
+  // memdump attaches over the LIVE link -- connect (done) but never reset or
+  // select() the target. In live mode the core keeps running; --freeze halts it
+  // just for the block read and resumes ASAP (see cmd_memdump). Return directly
+  // (like cmd_rtt): the normal exit path's disconnect_debugger() pulses nRESET,
+  // which would reset the very target we are dumping non-intrusively.
+  if (g_memdump)
+  {
+    cmd_memdump();
+    dap_disconnect();
+    dbg_close();
     return 0;
   }
 
