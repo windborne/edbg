@@ -54,6 +54,8 @@
 // Long-only options start past the ASCII range so they never collide with a
 // short flag letter in the getopt switch.
 #define OPT_DFU           0x100
+#define OPT_RTT           0x101
+#define OPT_RTT_ADDR      0x102
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -80,6 +82,8 @@ static const struct option long_options[] =
   { "fuse",      required_argument,  0, 'F' },
   { "identify",  no_argument,  0, 'i' },
   { "dfu",       no_argument,  0, OPT_DFU },
+  { "rtt",       no_argument,        0, OPT_RTT },
+  { "rtt-addr",  required_argument,  0, OPT_RTT_ADDR },
   { 0, 0, 0, 0 }
 };
 
@@ -89,6 +93,8 @@ static const char *short_options = "hbepvkurf:t:ls:c:o:z:F:i";
 static char *g_serial = NULL;
 static bool g_list = false;
 static bool g_dfu = false;
+static bool g_rtt = false;
+static uint32_t g_rtt_addr = 0;
 static char *g_target = NULL;
 static bool g_verbose = false;
 static long g_clock = 16000000;
@@ -474,6 +480,9 @@ static void print_help(char *name)
       "  -i, --identify             print core id of target\n"
       "      --dfu                  send the Windborne frog DFU trigger, then exit: the frog\n"
       "                             resets into the SAM-BA bootloader for a bossac reflash\n"
+      "      --rtt                  bridge the target's SEGGER RTT ring buffers to stdio while\n"
+      "                             the core runs (no halt); needs -t and --rtt-addr\n"
+      "      --rtt-addr <addr>      address of the _SEGGER_RTT control block (from the ELF/.map)\n"
     );
   }
 
@@ -542,6 +551,8 @@ static void parse_command_line(int argc, char **argv)
       case 'F': g_target_options.fuse_cmd = optarg; break;
       case 'i': g_target_options.identify = true; break;
       case OPT_DFU: g_dfu = true; break;
+      case OPT_RTT: g_rtt = true; break;
+      case OPT_RTT_ADDR: g_rtt_addr = (uint32_t)strtoul(optarg, NULL, 0); break;
       default: exit(1); break;
     }
   }
@@ -598,6 +609,97 @@ static int select_debugger(debugger_t *debuggers, int n_debuggers)
 }
 
 //-----------------------------------------------------------------------------
+// RTT-over-SWD bridge: pump a target's SEGGER-layout ring buffers <-> stdio while
+// the core keeps running (background MEM-AP access, no halt). Wrap this in a PTY
+// (socat/a tiny script) and tacoma -- or any RTT viewer -- uses the byte stream as
+// a serial port, unchanged. On any SWD fault the dap layer error_exits; a
+// supervisor respawns us, which reconnects: that's the re-attach-after-reset /
+// marginal-cable recovery, kept out here instead of complicating the loop.
+static void cmd_rtt(void)
+{
+  // SEGGER control-block layout (matches boards/lib/rtt/rtt.c):
+  //   0 char acID[16]  16 i32 MaxUp  20 i32 MaxDown  24 RING up[0]  48 RING down[0]
+  //   RING(24): 0 sName*  4 pBuffer*  8 SizeOfBuffer  12 WrOff  16 RdOff  20 Flags
+  enum { UP = 24, DOWN = 48, R_PBUF = 4, R_SIZE = 8, R_WR = 12, R_RD = 16 };
+  uint32_t cb = g_rtt_addr;
+
+  if (0 == cb)
+    error_exit("--rtt needs --rtt-addr <_SEGGER_RTT address> (from the target ELF/.map)");
+
+  // Validate the id so a wrong address fails loudly instead of streaming garbage.
+  uint8_t id[16];
+  dap_read_block(cb, id, sizeof(id));
+  if (0 != memcmp(id, "SEGGER RTT", 10))
+    error_exit("no RTT control block at 0x%08x (id mismatch)", (unsigned)cb);
+
+  uint32_t up_buf  = dap_read_word(cb + UP + R_PBUF);
+  uint32_t up_size = dap_read_word(cb + UP + R_SIZE);
+  uint32_t dn_buf  = dap_read_word(cb + DOWN + R_PBUF);
+  uint32_t dn_size = dap_read_word(cb + DOWN + R_SIZE);
+
+  fprintf(stderr, "RTT bridge: up %u B / down %u B at 0x%08x\n",
+      (unsigned)up_size, (unsigned)dn_size, (unsigned)cb);
+
+  fcntl(0, F_SETFL, fcntl(0, F_GETFL, 0) | O_NONBLOCK);   // non-blocking stdin
+
+  uint8_t scratch[256];
+
+  for (;;)
+  {
+    // up: target -> host (stdout). Snapshot WrOff, drain to it.
+    uint32_t wr = dap_read_word(cb + UP + R_WR);
+    uint32_t rd = dap_read_word(cb + UP + R_RD);
+
+    while (rd != wr)
+    {
+      uint32_t run = (wr > rd ? wr : up_size) - rd;   // contiguous run to wr or the wrap
+      if (run > sizeof(scratch))
+        run = sizeof(scratch);
+
+      // dap_read_block is word-granular: read the covering aligned span, copy bytes.
+      uint32_t a = up_buf + rd;
+      uint32_t s = a & ~3u;
+      uint32_t e = (a + run + 3u) & ~3u;
+      uint8_t tmp[e - s];
+
+      dap_read_block(s, tmp, (int)(e - s));
+
+      if (write(STDOUT_FILENO, tmp + (a - s), run) < 0)
+        return;                                       // stdout closed
+
+      rd += run;
+      if (rd >= up_size)
+        rd -= up_size;
+      dap_write_word(cb + UP + R_RD, rd);
+    }
+
+    // down: host (stdin) -> target
+    int n = (int)read(STDIN_FILENO, scratch, sizeof(scratch));
+    if (0 == n)
+      return;                                         // stdin EOF
+    if (n > 0)
+    {
+      uint32_t dwr = dap_read_word(cb + DOWN + R_WR);
+      uint32_t drd = dap_read_word(cb + DOWN + R_RD);
+
+      for (int i = 0; i < n; i++)
+      {
+        uint32_t nx = dwr + 1;
+        if (nx >= dn_size)
+          nx = 0;
+        if (nx == drd)
+          break;                                      // ring full -> drop (host resyncs on CRC)
+        dap_write_byte(dn_buf + dwr, scratch[i]);
+        dwr = nx;
+      }
+      dap_write_word(cb + DOWN + R_WR, dwr);           // publish after the data
+    }
+
+    usleep(1000);   // 1 ms poll -- pokes are latency-tolerant, keeps SWD load low
+  }
+}
+
+//-----------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
   debugger_t debuggers[MAX_DEBUGGERS];
@@ -609,7 +711,7 @@ int main(int argc, char **argv)
 
   if (!(g_target_options.erase || g_target_options.program || g_target_options.verify ||
       g_target_options.lock || g_target_options.read || g_target_options.fuse_cmd ||
-      g_list || g_dfu || g_target))
+      g_list || g_dfu || g_rtt || g_target))
     error_exit("no actions specified");
 
   if (g_target_options.read && (g_target_options.erase || g_target_options.program ||
@@ -666,6 +768,14 @@ int main(int argc, char **argv)
   print_clock_freq(g_clock);
 
   reconnect_debugger();
+
+  // RTT bridges target RAM rings over the LIVE link -- connect (done) but never
+  // select()/halt the core; the target keeps running.
+  if (g_rtt)
+  {
+    cmd_rtt();
+    return 0;
+  }
 
   // Flashing does its select() inside the retry block below (so a transient
   // connect failure on a marginal cable retries with the rest); other ops
