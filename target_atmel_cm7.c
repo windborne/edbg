@@ -140,13 +140,30 @@ static void target_select(target_options_t *options)
 {
   uint32_t chip_id, chip_exid;
 
-  dap_reset_target_hw(1);
-  dap_reset_link();
+  // EDBG_CUR = connect-under-reset. Hold the core in reset (nRESET low) while we
+  // attach to the DP -- which lives in the always-on debug power domain and so
+  // answers even with the core held in reset -- arm the reset vector-catch, then
+  // release nRESET so the core halts at the reset vector BEFORE it runs a single
+  // instruction. The only way in when the resident firmware wedges the SWD debug
+  // port, drives the debug pins, or otherwise won't let a live attach halt it.
+  if (getenv("EDBG_CUR"))
+  {
+    dap_reset_target_hw(0);
+    dap_reset_link();
+    dap_write_word(DEMCR, DEMCR_VC_CORERESET);
+    dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);
+    dap_reset_target_hw(1);
+  }
+  else
+  {
+    dap_reset_target_hw(1);
+    dap_reset_link();
 
-  // Stop the core
-  dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);
-  dap_write_word(DEMCR, DEMCR_VC_CORERESET);
-  dap_write_word(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ);
+    // Stop the core
+    dap_write_word(DHCSR, DHCSR_DBGKEY | DHCSR_DEBUGEN | DHCSR_HALT);
+    dap_write_word(DEMCR, DEMCR_VC_CORERESET);
+    dap_write_word(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ);
+  }
 
   chip_id = dap_read_word(CHIPID_CIDR);
   chip_exid = dap_read_word(CHIPID_EXID);
