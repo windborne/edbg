@@ -44,6 +44,7 @@
 #include <linux/input.h>
 #include <linux/hidraw.h>
 #include <libudev.h>
+#include <linux/usbdevice_fs.h>
 #include "edbg.h"
 #include "dbg.h"
 
@@ -150,9 +151,156 @@ static int parse_hid_report_desc(uint8_t *data, int size)
   return input;
 }
 
+
+/*- CMSIS-DAP v2 (bulk) backend via usbfs -----------------------------------*/
+// The frog also exposes a WinUSB/vendor bulk interface (CMSIS-DAP v2). With --v2
+// edbg drives it over usbfs bulk ioctls instead of the HID interrupt endpoints:
+// raw DAP packets (no HID report byte), higher throughput. Enumeration is shared
+// (every frog advertises "CMSIS-DAP" on its HID interface); only open/transfer
+// differ. Frog v2 layout: interface 3, EP6 OUT / EP7 IN, 512-byte bulk.
+extern bool dbg_use_v2;
+
+#define V2_IFACE    3
+#define V2_EP_OUT   0x06
+#define V2_EP_IN    0x87
+#define V2_MAXPKT   512
+#define V2_QUEUE    32
+
+static int v2_fd = -1;
+// The frog processes one packet at a time, so defer the bulk round-trip to reap
+// and hold submitted requests in a FIFO (edbg's pipeline window <= V2_QUEUE).
+static struct { uint8_t buf[DBG_MAX_EP_SIZE]; int len; } v2_q[V2_QUEUE];
+static int v2_q_head, v2_q_tail;
+
+static char *v2_find_node(const char *serial)
+{
+  struct udev *udev = udev_new();
+  struct udev_enumerate *e = udev_enumerate_new(udev);
+  struct udev_list_entry *devs, *le;
+  char *node = NULL;
+
+  udev_enumerate_add_match_subsystem(e, "usb");
+  udev_enumerate_add_match_property(e, "DEVTYPE", "usb_device");
+  udev_enumerate_scan_devices(e);
+  devs = udev_enumerate_get_list_entry(e);
+
+  udev_list_entry_foreach(le, devs)
+  {
+    struct udev_device *d = udev_device_new_from_syspath(udev, udev_list_entry_get_name(le));
+    const char *s = udev_device_get_sysattr_value(d, "serial");
+    const char *dn = udev_device_get_devnode(d);
+    if (s && dn && 0 == strcmp(s, serial))
+      node = strdup(dn);
+    udev_device_unref(d);
+    if (node)
+      break;
+  }
+
+  udev_enumerate_unref(e);
+  udev_unref(udev);
+  return node;
+}
+
+static void dbg_open_v2(debugger_t *debugger)
+{
+  char *node = v2_find_node(debugger->serial);
+  int iface = V2_IFACE;
+
+  if (!node)
+    error_exit("v2: no usb device node for serial %s", debugger->serial);
+
+  v2_fd = open(node, O_RDWR);
+  if (v2_fd < 0)
+    error_exit("v2: open %s: %s", node, strerror(errno));
+  free(node);
+
+  if (ioctl(v2_fd, USBDEVFS_CLAIMINTERFACE, &iface) < 0)
+    error_exit("v2: claim interface %d: %s (is the frog running a v2 build?)",
+        iface, strerror(errno));
+
+  report_size = DBG_MAX_EP_SIZE;   // the frog reports its real packet size via DAP_Info
+  v2_q_head = v2_q_tail = 0;
+}
+
+static void dbg_close_v2(void)
+{
+  int iface = V2_IFACE;
+  if (v2_fd >= 0)
+  {
+    ioctl(v2_fd, USBDEVFS_RELEASEINTERFACE, &iface);
+    close(v2_fd);
+    v2_fd = -1;
+  }
+}
+
+static int v2_bulk(unsigned int ep, uint8_t *data, int len)
+{
+  struct usbdevfs_bulktransfer b;
+  int r;
+
+  b.ep = ep;
+  b.len = len;
+  b.timeout = 5000;
+  b.data = data;
+
+  r = ioctl(v2_fd, USBDEVFS_BULK, &b);
+  if (r < 0)
+    perror_exit("v2 bulk transfer");
+  return r;
+}
+
+static int dbg_dap_cmd_v2(uint8_t *data, int resp_size, int req_size)
+{
+  static uint8_t buf[DBG_MAX_EP_SIZE];
+  uint8_t cmd = data[0];
+  int res;
+
+  v2_bulk(V2_EP_OUT, data, req_size);
+  if ((req_size % V2_MAXPKT) == 0)
+    v2_bulk(V2_EP_OUT, buf, 0);   // terminating ZLP for an exact-multiple request
+
+  res = v2_bulk(V2_EP_IN, buf, sizeof(buf));
+  check(res, "empty response received");
+  check(buf[0] == cmd, "invalid response received");
+
+  // Strip the command echo like the HID backend does -- edbg's dap.c layer
+  // expects the transport to return the response payload without it.
+  res--;
+  memcpy(data, &buf[1], (resp_size < res) ? resp_size : res);
+  return res;
+}
+
+static void dbg_dap_cmd_submit_v2(uint8_t *data, int req_size)
+{
+  int next = (v2_q_tail + 1) % V2_QUEUE;
+  if (next == v2_q_head)
+    error_exit("v2: submit queue overflow");
+  memcpy(v2_q[v2_q_tail].buf, data, req_size);
+  v2_q[v2_q_tail].len = req_size;
+  v2_q_tail = next;
+}
+
+static int dbg_dap_cmd_reap_v2(uint8_t cmd, uint8_t *data, int resp_size)
+{
+  int idx, res;
+  (void)cmd;   // dbg_dap_cmd_v2() checks the echo against the request itself
+
+  if (v2_q_head == v2_q_tail)
+    return -1;   // nothing queued
+
+  idx = v2_q_head;
+  v2_q_head = (v2_q_head + 1) % V2_QUEUE;
+
+  res = dbg_dap_cmd_v2(v2_q[idx].buf, resp_size, v2_q[idx].len);
+  memcpy(data, v2_q[idx].buf, (resp_size < res) ? resp_size : res);
+  return res;
+}
+
 //-----------------------------------------------------------------------------
 void dbg_open(debugger_t *debugger)
 {
+  if (dbg_use_v2) { dbg_open_v2(debugger); return; }
+
   struct hidraw_report_descriptor rpt_desc;
   struct hidraw_devinfo info;
   int desc_size, res;
@@ -212,6 +360,8 @@ void dbg_open(debugger_t *debugger)
 //-----------------------------------------------------------------------------
 void dbg_close(void)
 {
+  if (dbg_use_v2) { dbg_close_v2(); return; }
+
   if (debugger_fd)
     close(debugger_fd);
 }
@@ -225,6 +375,8 @@ int dbg_get_report_size(void)
 //-----------------------------------------------------------------------------
 int dbg_dap_cmd(uint8_t *data, int resp_size, int req_size)
 {
+  if (dbg_use_v2) return dbg_dap_cmd_v2(data, resp_size, req_size);
+
   uint8_t cmd = data[0];
   int res;
 
@@ -254,6 +406,8 @@ int dbg_dap_cmd(uint8_t *data, int resp_size, int req_size)
 //-----------------------------------------------------------------------------
 void dbg_dap_cmd_submit(uint8_t *data, int req_size)
 {
+  if (dbg_use_v2) { dbg_dap_cmd_submit_v2(data, req_size); return; }
+
   int res;
 
   memset(hid_buffer, 0xff, report_size + 1);
@@ -271,6 +425,8 @@ void dbg_dap_cmd_submit(uint8_t *data, int req_size)
 // of exiting -- lets idempotent bulk transfers drain and retry transients.
 int dbg_dap_cmd_reap_try(uint8_t cmd, uint8_t *data, int resp_size)
 {
+  if (dbg_use_v2) return dbg_dap_cmd_reap_v2(cmd, data, resp_size);
+
   int res;
 
   res = read(debugger_fd, hid_buffer, report_size + 1);
@@ -289,6 +445,8 @@ int dbg_dap_cmd_reap_try(uint8_t cmd, uint8_t *data, int resp_size)
 //-----------------------------------------------------------------------------
 int dbg_dap_cmd_reap(uint8_t cmd, uint8_t *data, int resp_size)
 {
+  if (dbg_use_v2) return dbg_dap_cmd_reap_v2(cmd, data, resp_size);
+
   int res;
 
   res = read(debugger_fd, hid_buffer, report_size + 1);

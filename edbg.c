@@ -60,6 +60,7 @@
 #define OPT_RTT_SCAN_LEN  0x104
 #define OPT_MEMDUMP       0x105
 #define OPT_FREEZE        0x106
+#define OPT_V2            0x107
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -91,6 +92,7 @@ static const struct option long_options[] =
   { "rtt-scan",  required_argument,  0, OPT_RTT_SCAN },
   { "rtt-scan-len", required_argument, 0, OPT_RTT_SCAN_LEN },
   { "memdump",   no_argument,        0, OPT_MEMDUMP },
+  { "v2",        no_argument,        0, OPT_V2 },
   { "freeze",    no_argument,        0, OPT_FREEZE },
   { 0, 0, 0, 0 }
 };
@@ -99,6 +101,7 @@ static const char *short_options = "hbepvkurf:t:ls:c:o:z:F:i";
 
 /*- Variables ---------------------------------------------------------------*/
 static char *g_serial = NULL;
+bool dbg_use_v2 = false;   // --v2: talk to the frog CMSIS-DAP v2 bulk interface
 static bool g_list = false;
 static bool g_dfu = false;
 static bool g_rtt = false;
@@ -571,6 +574,7 @@ static void parse_command_line(int argc, char **argv)
       case 't': g_target = optarg; break;
       case 'l': g_list = true; break;
       case 's': g_serial = optarg; break;
+      case OPT_V2: dbg_use_v2 = true; break;
       case 'c': g_clock = strtoul(optarg, NULL, 0) * 1000; g_clock_explicit = true; break;
       case 'b': g_verbose = true; break;
       case 'o': g_target_options.offset = (uint32_t)strtoul(optarg, NULL, 0); break;
