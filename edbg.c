@@ -1091,7 +1091,8 @@ int main(int argc, char **argv)
   if (g_target_options.identify && !(g_target_options.program || g_target_options.verify))
   {
     verbose("Indentifying... \n");
-    target_ops->identify();
+    if (target_ops->identify)   // most drivers have no identify fn (select() already
+      target_ops->identify();   // printed the device); calling NULL segfaulted -i
     verbose("done.\n");
   }
 
